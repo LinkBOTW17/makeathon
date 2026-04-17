@@ -1,0 +1,11 @@
+geopandas~=1.0.0
+numpy~=1.26.4
+matplotlib~=3.9.0
+pandas~=2.2.2
+rasterio~=1.4.3
+shapely~=2.0.3
+boto3~=1.34
+botocore  # Version defined by boto3, but explicitly imported
+tqdm~=4.66
+ipykernel
+jupyter
