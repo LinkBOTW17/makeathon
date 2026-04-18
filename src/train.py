@@ -71,12 +71,20 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # We create the dataset with a sequence length of 12 (approx 1 year dataset)
     dataset = OsapiensDataset(data_root=DATA_ROOT, split="train", seq_len=12)
     # Tuned for 192GB VRAM and 20 vCPUs
     dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=16, pin_memory=True, collate_fn=pad_collate_fn)
     
-    model = FusionNet(s1_channels=2, s2_channels=10, aef_channels=768, num_classes=1).to(device)
+    print("Auto-detecting channel dimensions from the first batch...")
+    first_batch = next(iter(dataloader))
+    
+    s1_dim = first_batch["s1"].shape[2] if first_batch["s1"].nelement() > 0 else 2
+    s2_dim = first_batch["s2"].shape[2] if first_batch["s2"].nelement() > 0 else 10
+    aef_dim = first_batch["aef"].shape[1] if first_batch["aef"].nelement() > 0 else 768
+    
+    print(f"Detected Channels -> S1: {s1_dim}, S2: {s2_dim}, AEF: {aef_dim}")
+    
+    model = FusionNet(s1_channels=s1_dim, s2_channels=s2_dim, aef_channels=aef_dim, num_classes=1).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
     scaler = torch.amp.GradScaler('cuda')
     
