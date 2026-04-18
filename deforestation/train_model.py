@@ -676,8 +676,10 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
             col = max(0, min(col, W - 1))
             row = max(0, min(row, H - 1))
             yr  = int(yr_offset[row, col]) + 2020
+            # Format as YYMM — use mid-year (06) since AEF gives year precision only
+            time_step = f"{yr % 100:02d}06"
             polygons.append(geom)
-            years.append(yr)
+            years.append(time_step)
 
         if not polygons:
             continue
@@ -707,8 +709,8 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
         print(f"\n  Submission GeoJSON → {out_path}")
         print(f"  Total deforestation polygons : {len(submission)}")
         yr_counts = submission["time_step"].value_counts().sort_index()
-        for yr, cnt in yr_counts.items():
-            print(f"    {yr}: {cnt} polygon(s)")
+        for ts, cnt in yr_counts.items():
+            print(f"    {ts} (20{ts[:2]}-{ts[2:]}): {cnt} polygon(s)")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
