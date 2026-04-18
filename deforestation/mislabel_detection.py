@@ -744,7 +744,25 @@ def _get_train_tiles() -> list[str]:
     meta_path = DATA_ROOT / "metadata" / "train_tiles.geojson"
     with open(meta_path) as f:
         gj = json.load(f)
-    return [feat["properties"]["tile_id"] for feat in gj["features"]]
+
+    # Auto-detect the property key that holds the tile ID
+    candidate_keys = ["tile_id", "id", "name", "tile", "TILE_ID", "tileid", "tile_name"]
+    props = gj["features"][0]["properties"]
+    key = next((k for k in candidate_keys if k in props), None)
+
+    if key is None:
+        # Fall back: pick the property whose value looks like a tile ID (e.g. 18NWG_6_6)
+        import re
+        pattern = re.compile(r"^\d{2}[A-Z]{3}_\d+_\d+$")
+        key = next((k for k, v in props.items() if isinstance(v, str) and pattern.match(v)), None)
+
+    if key is None:
+        raise KeyError(
+            f"Cannot find tile ID property in train_tiles.geojson. "
+            f"Available properties: {list(props.keys())}"
+        )
+
+    return [feat["properties"][key] for feat in gj["features"]]
 
 
 if __name__ == "__main__":
