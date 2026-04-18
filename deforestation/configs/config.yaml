@@ -67,6 +67,24 @@ aef:
   n_bands: 64
   year: 2022    # embeddings generated for full-year 2022 window
 
+# ─── Feature extraction (Phase 2) ─────────────────────────────────────────────
+feature_extraction:
+  # S2 band indices (1-based) needed for spectral index computation
+  s2_red_band:   3    # B4  Red
+  s2_nir_band:   7    # B8  NIR
+  s2_swir2_band: 11   # B12 SWIR2
+  s2_scl_band:   12   # SCL Scene Classification Layer
+  # SCL pixel classes treated as valid (cloud-free)
+  # 2=dark, 4=vegetation, 5=not-veg, 6=water, 7=unclassified, 11=snow
+  scl_valid_values: [2, 4, 5, 6, 7, 11]
+  # S2 reflectance scale factor (raw integers ÷ this = [0, 1])
+  s2_scale_factor: 10000
+  # Convert S1 VV linear backscatter to dB before computing stats
+  s1_db_conversion: true
+  s1_db_eps: 1.0e-10   # avoid log(0)
+  # S1 orbit to use
+  s1_orbit: ascending
+
 # ─── XGBoost baseline (Phase 3a) ──────────────────────────────────────────────
 xgboost:
   n_estimators: 500

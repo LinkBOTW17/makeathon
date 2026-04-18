@@ -148,6 +148,203 @@ def find_glads2_date(glads2_dir: str, tile_id: str) -> "Path | None":
     ])
 
 
+# ─── Coordinate & raster sampling helpers (Phase 2+) ─────────────────────────
+
+def get_pixel_xy_coords(radd_path: str, rows: np.ndarray, cols: np.ndarray):
+    """
+    Convert RADD grid (row, col) indices to (x, y) coordinates in the RADD CRS.
+    Returns xs, ys arrays and the CRS object.
+    """
+    import rasterio
+    import rasterio.transform as rt
+
+    with rasterio.open(radd_path) as src:
+        transform = src.transform
+        crs = src.crs
+
+    # rasterio.transform.xy returns centres of pixels
+    xs, ys = rt.xy(transform, rows, cols)
+    return np.array(xs, dtype=np.float64), np.array(ys, dtype=np.float64), crs
+
+
+def transform_coords(xs: np.ndarray, ys: np.ndarray, src_crs, dst_crs) -> tuple:
+    """Reproject (xs, ys) from src_crs to dst_crs using rasterio.warp."""
+    from rasterio.warp import transform as warp_transform
+
+    xs_dst, ys_dst = warp_transform(src_crs, dst_crs, xs.tolist(), ys.tolist())
+    return np.array(xs_dst, dtype=np.float64), np.array(ys_dst, dtype=np.float64)
+
+
+def read_raster_at_coords(raster_path: str, xs: np.ndarray, ys: np.ndarray,
+                           src_crs, band_indices: list | None = None) -> np.ndarray:
+    """
+    Read a raster at a list of (x, y) geographic coordinates (in src_crs).
+    Returns array of shape (n_pixels, n_bands).
+    Pixels outside the raster extent are filled with NaN.
+
+    Uses read-all-then-index for speed — tiles are assumed to fit in RAM.
+    """
+    import rasterio
+    import rasterio.transform as rt
+
+    with rasterio.open(raster_path) as src:
+        if band_indices is None:
+            band_indices = list(range(1, src.count + 1))
+
+        # Transform coords into this raster's CRS if different
+        if src.crs != src_crs:
+            xs_r, ys_r = transform_coords(xs, ys, src_crs, src.crs)
+        else:
+            xs_r, ys_r = xs, ys
+
+        # Convert geographic coords → pixel row/col
+        rows_r, cols_r = rt.rowcol(src.transform, xs_r, ys_r)
+        rows_r = np.asarray(rows_r, dtype=np.int64)
+        cols_r = np.asarray(cols_r, dtype=np.int64)
+
+        H, W = src.height, src.width
+        valid = (rows_r >= 0) & (rows_r < H) & (cols_r >= 0) & (cols_r < W)
+
+        data = src.read(band_indices).astype(np.float32)   # (n_bands, H, W)
+
+    n_pixels = len(xs)
+    n_bands  = len(band_indices)
+    result   = np.full((n_pixels, n_bands), np.nan, dtype=np.float32)
+    if valid.any():
+        result[valid] = data[:, rows_r[valid], cols_r[valid]].T
+
+    return result
+
+
+# ─── Spectral indices ─────────────────────────────────────────────────────────
+
+def spectral_index(b1: np.ndarray, b2: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Generic normalized difference: (b1 - b2) / (b1 + b2)."""
+    denom = b1 + b2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        idx = np.where(np.abs(denom) > eps, (b1 - b2) / denom, np.nan)
+    return idx.astype(np.float32)
+
+
+# ─── Temporal statistics ──────────────────────────────────────────────────────
+
+def compute_ts_stats(ts: np.ndarray, prefix: str) -> dict:
+    """
+    Compute summary statistics over a (n_pixels, T) time series with possible NaN.
+
+    Returns dict of {prefix_stat: array of shape (n_pixels,)}.
+    Stats: mean, std, min, max, slope (linear trend), max_drop, valid_frac.
+    """
+    n, T = ts.shape
+
+    with np.errstate(all="ignore"):
+        mean_v  = np.nanmean(ts, axis=1)
+        std_v   = np.nanstd(ts, axis=1)
+        min_v   = np.nanmin(ts, axis=1)
+        max_v   = np.nanmax(ts, axis=1)
+
+    # Valid fraction
+    valid_frac = np.isfinite(ts).sum(axis=1) / T
+
+    # Linear trend slope via least-squares on valid timesteps
+    t_idx = np.arange(T, dtype=np.float32)
+    slope = np.full(n, np.nan, dtype=np.float32)
+    for i in range(n):
+        mask = np.isfinite(ts[i])
+        if mask.sum() >= 3:
+            try:
+                slope[i] = np.polyfit(t_idx[mask], ts[i, mask], 1)[0]
+            except Exception:
+                pass
+
+    # Max single-step drop (largest decrease between consecutive timesteps)
+    diffs    = np.diff(ts, axis=1)  # (n, T-1)
+    max_drop = np.full(n, np.nan, dtype=np.float32)
+    for i in range(n):
+        valid_d = diffs[i][np.isfinite(diffs[i])]
+        if len(valid_d) > 0:
+            max_drop[i] = float(np.min(valid_d))  # most negative diff = biggest drop
+
+    return {
+        f"{prefix}_mean":       mean_v.astype(np.float32),
+        f"{prefix}_std":        std_v.astype(np.float32),
+        f"{prefix}_min":        min_v.astype(np.float32),
+        f"{prefix}_max":        max_v.astype(np.float32),
+        f"{prefix}_slope":      slope,
+        f"{prefix}_max_drop":   max_drop,
+        f"{prefix}_valid_frac": valid_frac.astype(np.float32),
+    }
+
+
+# ─── File discovery helpers ───────────────────────────────────────────────────
+
+def discover_s2_files(s2_tile_dir: str) -> list:
+    """
+    Discover available Sentinel-2 files for one tile.
+    Pattern: <tile>__s2_l2a_<year>_<month>.tif
+    Returns list of (year, month, Path) sorted chronologically.
+    """
+    result = []
+    for f in Path(s2_tile_dir).glob("*__s2_l2a_*.tif"):
+        parts = f.stem.split("_")
+        try:
+            # Last token = month, second-to-last = year
+            month = int(parts[-1])
+            year  = int(parts[-2])
+            result.append((year, month, f))
+        except (ValueError, IndexError):
+            continue
+    return sorted(result)
+
+
+def discover_s1_files(s1_tile_dir: str, orbit: str = "ascending") -> list:
+    """
+    Discover available Sentinel-1 files for one tile.
+    Pattern: <tile>__s1_rtc_<year>_<month>_<orbit>.tif
+    Returns list of (year, month, Path) sorted chronologically.
+    """
+    result = []
+    for f in Path(s1_tile_dir).glob(f"*__s1_rtc_*_{orbit}.tif"):
+        parts = f.stem.split("_")
+        try:
+            # e.g. ['18NWG', '6', '6', '', 's1', 'rtc', '2020', '10', 'ascending']
+            # orbit = parts[-1], month = parts[-2], year = parts[-3]
+            month = int(parts[-2])
+            year  = int(parts[-3])
+            result.append((year, month, f))
+        except (ValueError, IndexError):
+            continue
+    return sorted(result)
+
+
+# ─── AEF helpers ─────────────────────────────────────────────────────────────
+
+def find_aef_file(aef_dir: str, tile_id: str, year: int) -> "Path | None":
+    """Locate AEF embedding file for a tile/year. Tries .tiff and .tif."""
+    d = Path(aef_dir)
+    return find_file_multi_pattern([
+        d / f"{tile_id}_{year}.tiff",
+        d / f"{tile_id}_{year}.tif",
+    ])
+
+
+def normalize_aef(data: np.ndarray) -> np.ndarray:
+    """
+    If AEF embeddings are stored as integers, normalize per-band to [0, 1].
+    Float data is returned as-is.
+    """
+    if not np.issubdtype(data.dtype, np.integer):
+        return data.astype(np.float32)
+
+    out = np.empty_like(data, dtype=np.float32)
+    for b in range(data.shape[0]):
+        band  = data[b].astype(np.float32)
+        b_min = float(np.nanmin(band))
+        b_max = float(np.nanmax(band))
+        out[b] = (band - b_min) / (b_max - b_min + 1e-8)
+    return out
+
+
 # ─── Metrics ──────────────────────────────────────────────────────────────────
 
 def compute_binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
