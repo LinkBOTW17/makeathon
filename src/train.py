@@ -56,7 +56,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device):
     return total_loss / len(dataloader)
 
 if __name__ == "__main__":
-    DATA_ROOT = "../data/makeathon-challenge/" # Adjust relative path
+    DATA_ROOT = "data/makeathon-challenge/" # Adjust relative path
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     

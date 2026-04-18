@@ -52,7 +52,7 @@ def write_prediction_raster(tile_id, mask, output_dir, reference_tif_path):
     return output_path
 
 if __name__ == "__main__":
-    DATA_ROOT = Path("../data/makeathon-challenge/")
+    DATA_ROOT = Path("data/makeathon-challenge/")
     TEST_ROOT = DATA_ROOT / "sentinel-2" / "test"
     OUTPUT_DIR = Path("predictions")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
