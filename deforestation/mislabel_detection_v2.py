@@ -134,7 +134,18 @@ def load_tile(tile_id: str, years: tuple[int, int] = (2020, 2024)) -> TileData:
             continue
         if yr not in year_range:
             continue
-        ndvi_stack.append(_ndvi(f))
+        ndvi = _ndvi(f)
+        if ndvi.shape != td.ref_shape:
+            reproj = np.full(td.ref_shape, np.nan, dtype=np.float32)
+            with rasterio.open(f) as src:
+                reproject(
+                    source=ndvi, destination=reproj,
+                    src_transform=src.transform, src_crs=src.crs,
+                    dst_transform=td.ref_transform, dst_crs=td.ref_crs,
+                    resampling=Resampling.bilinear,
+                )
+            ndvi = reproj
+        ndvi_stack.append(ndvi)
         ndvi_months.append(_month_index(yr, mo))
 
     if ndvi_stack:
