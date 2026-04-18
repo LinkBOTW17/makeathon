@@ -74,9 +74,17 @@ if __name__ == "__main__":
     pbar = tqdm(dataset, desc="Running Inference")
     for sample in pbar:
         tile_id = sample["tile_id"]
-        s1 = sample["s1"].unsqueeze(0).to(device)
-        s2 = sample["s2"].unsqueeze(0).to(device)
-        aef = sample["aef"].unsqueeze(0).to(device)
+        s1 = sample["s1"].unsqueeze(0)
+        s2 = sample["s2"].unsqueeze(0)
+        aef = sample["aef"].unsqueeze(0)
+        
+        def norm(x):
+            if x.nelement() == 0: return x
+            return (x - x.mean()) / (x.std() + 1e-6)
+
+        s1  = norm(s1.to(device))
+        s2  = norm(s2.to(device))
+        aef = norm(aef.to(device))
         
         # MC Dropout for Prediction and Uncertainty
         mean_prob, uncertainty = run_mc_dropout(model, s1, s2, aef, num_samples=5)

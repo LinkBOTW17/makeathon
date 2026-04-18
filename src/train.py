@@ -13,26 +13,34 @@ def confidence_weighted_bce_loss(logits, targets):
     """BCE with logits — targets are already soft [0,1] consensus values."""
     return F.binary_cross_entropy_with_logits(logits, targets)
 
-def train_one_epoch(model, dataloader, optimizer, scaler, device):
+def train_one_epoch(model, dataloader, optimizer, device):
     model.train()
     total_loss = 0.0
     
     pbar = tqdm(dataloader, desc="Training")
     for batch in pbar:
-        s1  = batch["s1"].to(device)   # (B, T, C_s1, H, W)
-        s2  = batch["s2"].to(device)   # (B, T, C_s2, H, W)
-        aef = batch["aef"].to(device)  # (B, C_aef, H, W)
-        target = batch["label"].to(device)  # (B, 1, H, W) soft consensus
+        # Load and dynamically normalize raw satellite inputs to mean=0, std=1 to prevent exploding gradients
+        def norm(x):
+            if x.nelement() == 0: return x
+            # Normalize across the batch/spatial dims
+            return (x - x.mean()) / (x.std() + 1e-6)
+
+        s1  = norm(batch["s1"].to(device))
+        s2  = norm(batch["s2"].to(device))
+        aef = norm(batch["aef"].to(device))
+        target = batch["label"].to(device)  
         
         optimizer.zero_grad()
         
-        with torch.amp.autocast('cuda'):
-            logits = model(s1, s2, aef)       # (B, 1, H, W)
-            loss = confidence_weighted_bce_loss(logits, target)
+        logits = model(s1, s2, aef)       
+        loss = confidence_weighted_bce_loss(logits, target)
             
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        
+        # Clip max gradients to prevent any remaining instability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
         
         total_loss += loss.item()
         pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
@@ -93,12 +101,11 @@ if __name__ == "__main__":
     
     model = FusionNet(s1_channels=s1_dim, s2_channels=s2_dim, aef_channels=aef_dim, num_classes=1).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
-    scaler = torch.amp.GradScaler('cuda')
     
     num_epochs = 10
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
-        avg_loss = train_one_epoch(model, dataloader, optimizer, scaler, device)
+        avg_loss = train_one_epoch(model, dataloader, optimizer, device)
         print(f"Epoch Loss: {avg_loss:.4f}")
         
         # Save checkpoint
