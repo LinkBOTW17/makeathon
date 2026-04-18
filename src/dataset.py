@@ -31,6 +31,31 @@ class OsapiensDataset(Dataset):
             
         self.tiles = sorted(list(set(self.tiles)))
 
+    def _align_arrays(self, arrays: list[np.ndarray]) -> list[np.ndarray]:
+        if not arrays:
+            return arrays
+            
+        # Use the first array's spatial shape as the master template
+        target_shape = arrays[0].shape
+        channels, target_h, target_w = target_shape[0], target_shape[1], target_shape[2]
+        
+        aligned = []
+        for arr in arrays:
+            c, h, w = arr.shape
+            if (c, h, w) == target_shape:
+                aligned.append(arr)
+            else:
+                # Pad with zeros or crop to fit exactly
+                new_arr = np.zeros((c, target_h, target_w), dtype=arr.dtype)
+                copy_h = min(h, target_h)
+                copy_w = min(w, target_w)
+                copy_c = min(c, channels)
+                
+                new_arr[:copy_c, :copy_h, :copy_w] = arr[:copy_c, :copy_h, :copy_w]
+                aligned.append(new_arr)
+                
+        return aligned
+
     def _read_raster(self, path: Path) -> np.ndarray:
         with rasterio.open(path) as src:
             return src.read()
@@ -47,7 +72,8 @@ class OsapiensDataset(Dataset):
         files = [files[i] for i in step_idx]
         
         arrays = [self._read_raster(f) for f in files]
-        return np.stack(arrays, axis=0)  # Shape: (seq_len, channels, H, W)
+        aligned_arrays = self._align_arrays(arrays)
+        return np.stack(aligned_arrays, axis=0)  # Shape: (seq_len, channels, H, W)
 
     def __len__(self):
         return len(self.tiles)
@@ -81,7 +107,8 @@ class OsapiensDataset(Dataset):
                     # Some sources have multiple years (alert21, alert22, etc.). 
                     # We compute the overall deforestation mask by taking the max across years.
                     arrays = [self._read_raster(f) for f in label_files]
-                    stacked = np.stack(arrays, axis=0)
+                    aligned_arrays = self._align_arrays(arrays)
+                    stacked = np.stack(aligned_arrays, axis=0)
                     labels[lname] = np.max(stacked, axis=0) # Cumulative mask
                 else:
                     labels[lname] = None
