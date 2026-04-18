@@ -108,7 +108,7 @@ if __name__ == "__main__":
     model = FusionNet(s1_channels=s1_dim, s2_channels=s2_dim, aef_channels=aef_dim, num_classes=1).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
     
-    num_epochs = 10
+    num_epochs = 15
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
         avg_loss = train_one_epoch(model, dataloader, optimizer, device)
