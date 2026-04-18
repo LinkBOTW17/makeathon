@@ -554,7 +554,7 @@ def predict_tile_pixels(
     # Clamp to [0.35, 0.80] to prevent extreme values for edge-case α.
     aef_alpha  = tuner.alpha.get(region, 0.5)
     raw_thresh = tuner.threshold.get(region, 0.5)
-    eff_thresh = float(np.clip(raw_thresh / (aef_alpha + 1e-6), 0.35, 0.80))
+    eff_thresh = float(np.clip(raw_thresh / (aef_alpha + 1e-6), 0.20, 0.60))
 
     binary_map = (p_aef_pixels >= eff_thresh).astype(np.uint8)
 
@@ -663,18 +663,23 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
             transform = src.transform
             crs       = src.crs
 
-        polygons = []
+        polygons, timesteps = [], []
         for geom_dict, val in shapes(binary, mask=binary, transform=transform):
             if val != 1:
                 continue
-            polygons.append(shape(geom_dict))
+            geom = shape(geom_dict)
+            cx, cy = geom.centroid.x, geom.centroid.y
+            col = max(0, min(int((cx - transform.c) / transform.a), binary.shape[1] - 1))
+            row = max(0, min(int((cy - transform.f) / transform.e), binary.shape[0] - 1))
+            yr  = int(yr_offset[row, col]) + 2020
+            yr  = max(2021, min(2024, yr))   # clamp to valid deforestation range
+            timesteps.append(f"{yr % 100:02d}06")
+            polygons.append(geom)
 
         if not polygons:
             continue
 
-        # time_step = null (omitted) — avoids format rejection by scorer.
-        # Year accuracy will be added once spatial IoU is confirmed working.
-        gdf = gpd.GeoDataFrame(geometry=polygons, crs=crs)
+        gdf = gpd.GeoDataFrame({"time_step": timesteps}, geometry=polygons, crs=crs)
         gdf = gdf.to_crs("EPSG:4326")
 
         # Area filter ≥ 0.5 ha
@@ -698,6 +703,8 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
     if verbose:
         print(f"\n  Submission GeoJSON → {out_path}")
         print(f"  Total deforestation polygons : {len(submission)}")
+        for ts, cnt in submission["time_step"].value_counts().sort_index().items():
+            print(f"    {ts} (20{ts[:2]}-{ts[2:]}): {cnt} polygon(s)")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
