@@ -22,13 +22,19 @@ def train_one_epoch(model, dataloader, optimizer, device):
         # Load and dynamically normalize raw satellite inputs to mean=0, std=1 to prevent exploding gradients
         def norm(x):
             if x.nelement() == 0: return x
+            # Scrub geospatial NODATA (NaNs and infs mapping to zero or valid numbers)
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
             # Normalize across the batch/spatial dims
             return (x - x.mean()) / (x.std() + 1e-6)
 
         s1  = norm(batch["s1"].to(device))
         s2  = norm(batch["s2"].to(device))
         aef = norm(batch["aef"].to(device))
+        
         target = batch["label"].to(device)  
+        target = torch.nan_to_num(target, nan=0.0, posinf=1.0, neginf=0.0)
+        # Prevent any -9999.0 Earth Engine NoData values from causing BCE target errors by clamping to soft [0,1]
+        target = torch.clamp(target, min=0.0, max=1.0)
         
         optimizer.zero_grad()
         
