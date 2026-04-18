@@ -1,30 +1,35 @@
 """
-Pixel-Level LightGBM — Deforestation Classifier
-================================================
+Pixel-Level LightGBM v2 — Full Multimodal Deforestation Classifier
+===================================================================
 
-Trains directly on pixels from training tiles, not on polygon aggregations.
+Features per pixel (149 total):
+  AEF change signals  (78):
+    aef_l2_delta_{2021-2024}       — L2 between consecutive year embeddings
+    aef_cos_delta_{2021-2024}      — cosine distance between consecutive years
+    aef_from2020_l2_{2021-2024}    — L2 drift from 2020 baseline
+    aef_max_delta_l2 + year_idx    — peak change magnitude and timing
+    aef_delta_vec_{0-63}           — 64-dim change vector (emb_2024 − emb_2020)
 
-Features per pixel (all change-based → generalises across regions):
-  aef_l2_delta_{2021-2024}      — L2 distance between consecutive year embeddings
-  aef_cos_delta_{2021-2024}     — cosine distance between consecutive year embeddings
-  aef_from2020_l2_{2021-2024}   — L2 drift from 2020 baseline
-  aef_max_delta_l2              — peak L2 change across all year pairs
-  aef_change_year_idx           — which year had the biggest change (0=2021 … 3=2024)
-  aef_delta_vec_{0-63}          — 64-dim change vector (emb_2024 − emb_2020)
-                                   captures semantic direction of land-cover change
+  NDVI signals  (4):
+    ndvi_pre, ndvi_post            — mean NDVI in 2020-21 vs 2022-24
+    ndvi_change                    — pre − post (positive = vegetation loss)
+    ndvi_std                       — temporal variance across full series
 
-Target:
-  Pixel-level majority vote of RADD + GLAD-S2 + GLAD-L weak labels,
-  with CL corrections from mislabels_v2.csv applied at polygon level.
+  SAR signals  (3):
+    sar_pre, sar_post              — mean SAR dB in 2020-21 vs 2022-24
+    sar_change                     — pre − post in dB
 
-Training strategy:
-  Stratified pixel sampling (balanced pos/neg) per tile.
-  Leave-one-tile-out CV per region for honest metric reporting.
-  Separate models for SEA and SAM; falls back to global for unknown regions.
+  AEF baseline  (64):
+    aef_2020_{0-63}                — 2020 embedding (forest type baseline)
+
+Post-processing:
+  Gaussian smoothing (σ=1.5) on probability map before threshold.
+  → kills isolated-pixel false positives, reduces FPR significantly.
+
+Threshold: IoU-optimal per region from LOTO-CV.
 
 Usage (from makeathon root):
     python deforestation/pixel_model.py --mode all
-    python deforestation/pixel_model.py --mode train
     python deforestation/pixel_model.py --mode predict --split test
 """
 
@@ -44,29 +49,32 @@ import rasterio
 from lightgbm import LGBMClassifier
 from rasterio.features import shapes
 from rasterio.warp import reproject, Resampling
-from shapely.geometry import mapping, shape
+from scipy.ndimage import gaussian_filter
+from shapely.geometry import shape
 from sklearn.preprocessing import RobustScaler
 
 warnings.filterwarnings("ignore")
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
-from mislabel_detection_v2 import DATA_ROOT, load_tile  # noqa: E402
-from validate_spatial import build_gt_pixel_map          # noqa: E402
+from mislabel_detection_v2 import DATA_ROOT, _ndvi, _s1_db  # noqa: E402
+from validate_spatial import build_gt_pixel_map               # noqa: E402
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-AEF_YEARS   = [2020, 2021, 2022, 2023, 2024]
-DELTA_YEARS = [2021, 2022, 2023, 2024]
-N_SAMPLE_PER_TILE = 60_000   # pixels per tile (balanced pos/neg)
+AEF_YEARS        = [2020, 2021, 2022, 2023, 2024]
+DELTA_YEARS      = [2021, 2022, 2023, 2024]
+N_FEATURES       = 149
+N_SAMPLE_PER_TILE = 60_000
+GAUSS_SIGMA      = 1.5    # spatial smoothing to kill isolated-pixel FP
 
 REGIONS = {"SEA": ("47", "48"), "SAM": ("18", "19")}
 
 LGBM_PARAMS = dict(
-    n_estimators=800,
+    n_estimators=1000,
     learning_rate=0.03,
-    max_depth=5,
-    num_leaves=24,
+    max_depth=6,
+    num_leaves=32,
     min_child_samples=20,
     subsample=0.8,
     colsample_bytree=0.7,
@@ -78,6 +86,18 @@ LGBM_PARAMS = dict(
     verbose=-1,
 )
 
+FEATURE_NAMES = (
+    [f"aef_l2_delta_{yr}"     for yr in DELTA_YEARS] +
+    [f"aef_cos_delta_{yr}"    for yr in DELTA_YEARS] +
+    [f"aef_from2020_l2_{yr}"  for yr in DELTA_YEARS] +
+    ["aef_max_delta_l2", "aef_change_year_idx"] +
+    [f"aef_delta_vec_{i:02d}" for i in range(64)] +
+    ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +
+    ["sar_pre", "sar_post", "sar_change"] +
+    [f"aef_2020_{i:02d}"      for i in range(64)]
+)
+assert len(FEATURE_NAMES) == N_FEATURES
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -86,7 +106,7 @@ def get_region(tile_id: str) -> str:
     for region, prefixes in REGIONS.items():
         if prefix in prefixes:
             return region
-    return "SAM"  # conservative fallback for unknown regions
+    return "SAM"
 
 
 def compute_iou(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -111,34 +131,24 @@ def compute_fpr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 # ── AEF loading ───────────────────────────────────────────────────────────────
 
 def _load_aef_reprojected(
-    path: Path,
-    ref_transform,
-    ref_crs,
-    ref_shape: tuple[int, int],
+    path: Path, ref_transform, ref_crs, ref_shape: tuple,
 ) -> np.ndarray:
-    """Load AEF tiff and reproject to S2 reference grid. Returns (bands, H, W)."""
     with rasterio.open(path) as src:
-        n_bands = src.count
-        out = np.zeros((n_bands, *ref_shape), dtype=np.float32)
-        for b in range(1, n_bands + 1):
+        n = src.count
+        out = np.zeros((n, *ref_shape), dtype=np.float32)
+        for b in range(1, n + 1):
             reproject(
-                source=src.read(b).astype(np.float32),
-                destination=out[b - 1],
+                source=src.read(b).astype(np.float32), destination=out[b - 1],
                 src_transform=src.transform, src_crs=src.crs,
                 dst_transform=ref_transform, dst_crs=ref_crs,
                 resampling=Resampling.bilinear,
             )
-    return out   # (64, H, W)
+    return out
 
 
 def load_aef_all_years(
-    tile_id: str,
-    split: str,
-    ref_transform,
-    ref_crs,
-    ref_shape: tuple[int, int],
+    tile_id: str, split: str, ref_transform, ref_crs, ref_shape: tuple,
 ) -> dict[int, np.ndarray]:
-    """Load all annual AEF files for a tile. Returns {year: (64, H, W)}."""
     aef_dir = DATA_ROOT / "aef-embeddings" / split
     result: dict[int, np.ndarray] = {}
     for f in aef_dir.glob(f"{tile_id}_*.tiff"):
@@ -151,101 +161,190 @@ def load_aef_all_years(
     return result
 
 
-# ── pixel feature extraction ──────────────────────────────────────────────────
+# ── NDVI + SAR pixel maps ─────────────────────────────────────────────────────
+
+def _month_index(year: int, month: int) -> int:
+    return (year - 2020) * 12 + (month - 1)
+
+
+def load_ndvi_sar_maps(
+    tile_id: str,
+    split: str,
+    ref_transform,
+    ref_crs,
+    ref_shape: tuple,
+) -> dict[str, np.ndarray]:
+    """
+    Returns pixel maps: ndvi_pre, ndvi_post, ndvi_change, ndvi_std,
+                        sar_pre,  sar_post,  sar_change
+    Each is (H, W) float32.  NaN where data is missing.
+    """
+    H, W = ref_shape
+    out: dict[str, np.ndarray] = {}
+
+    # ── NDVI from Sentinel-2 ──────────────────────────────────────────────────
+    s2_dir   = DATA_ROOT / "sentinel-2" / split / f"{tile_id}__s2_l2a"
+    s2_files = sorted(s2_dir.glob("*.tif"))
+    ndvi_stack, ndvi_months = [], []
+
+    for f in s2_files:
+        parts = f.stem.split("_")
+        try:
+            yr, mo = int(parts[-2]), int(parts[-1])
+        except (ValueError, IndexError):
+            continue
+        nd = _ndvi(f)
+        if nd.shape != (H, W):
+            reproj = np.full((H, W), np.nan, dtype=np.float32)
+            with rasterio.open(f) as src:
+                reproject(
+                    source=nd, destination=reproj,
+                    src_transform=src.transform, src_crs=src.crs,
+                    dst_transform=ref_transform, dst_crs=ref_crs,
+                    resampling=Resampling.bilinear,
+                )
+            nd = reproj
+        ndvi_stack.append(nd)
+        ndvi_months.append(_month_index(yr, mo))
+
+    if ndvi_stack:
+        ndvi_arr = np.stack(ndvi_stack, axis=0)            # (T, H, W)
+        months   = np.array(ndvi_months)
+        pre_sel  = months < 24
+        post_sel = months >= 24
+
+        with np.errstate(all="ignore"):
+            ndvi_pre  = np.nanmean(ndvi_arr[pre_sel],  axis=0) if pre_sel.any()  else np.full((H, W), np.nan)
+            ndvi_post = np.nanmean(ndvi_arr[post_sel], axis=0) if post_sel.any() else np.full((H, W), np.nan)
+            ndvi_std  = np.nanstd(ndvi_arr,             axis=0)
+
+        out["ndvi_pre"]    = ndvi_pre.astype(np.float32)
+        out["ndvi_post"]   = ndvi_post.astype(np.float32)
+        out["ndvi_change"] = (ndvi_pre - ndvi_post).astype(np.float32)
+        out["ndvi_std"]    = ndvi_std.astype(np.float32)
+
+    # ── SAR from Sentinel-1 ───────────────────────────────────────────────────
+    s1_dir   = DATA_ROOT / "sentinel-1" / split / f"{tile_id}__s1_rtc"
+    sar_stack, sar_months = [], []
+
+    for f in sorted(s1_dir.glob("*_ascending.tif")):
+        parts = f.stem.split("_")
+        try:
+            yr, mo = int(parts[-3]), int(parts[-2])
+        except (ValueError, IndexError):
+            continue
+        with rasterio.open(f) as src:
+            raw    = src.read(1).astype(np.float32)
+            reproj = np.zeros((H, W), dtype=np.float32)
+            reproject(
+                source=raw, destination=reproj,
+                src_transform=src.transform, src_crs=src.crs,
+                dst_transform=ref_transform, dst_crs=ref_crs,
+                resampling=Resampling.bilinear,
+            )
+        db = _s1_db(reproj)
+        sar_stack.append(db)
+        sar_months.append(_month_index(yr, mo))
+
+    if sar_stack:
+        sar_arr  = np.stack(sar_stack, axis=0)
+        months_s = np.array(sar_months)
+        pre_s    = months_s < 24
+        post_s   = months_s >= 24
+
+        with np.errstate(all="ignore"):
+            sar_pre  = np.nanmean(sar_arr[pre_s],  axis=0) if pre_s.any()  else np.full((H, W), np.nan)
+            sar_post = np.nanmean(sar_arr[post_s], axis=0) if post_s.any() else np.full((H, W), np.nan)
+
+        out["sar_pre"]    = sar_pre.astype(np.float32)
+        out["sar_post"]   = sar_post.astype(np.float32)
+        out["sar_change"] = (sar_pre - sar_post).astype(np.float32)
+
+    return out
+
+
+# ── pixel feature matrix ──────────────────────────────────────────────────────
 
 def compute_pixel_features(
     aef_by_year: dict[int, np.ndarray],
-    sample_rows: np.ndarray | None = None,
-    sample_cols: np.ndarray | None = None,
+    ndvi_sar:    dict[str, np.ndarray] | None,
+    rows: np.ndarray | None = None,
+    cols: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Compute per-pixel change features from annual AEF embeddings.
-
-    If sample_rows/sample_cols provided, only compute for those pixels.
-    Otherwise computes for all pixels and returns (H*W, n_feat) flattened.
-
-    Features (all change-based):
-      4  aef_l2_delta per year pair
-      4  aef_cos_delta per year pair
-      4  aef_from2020_l2 per year
-      1  aef_max_delta_l2
-      1  aef_change_year_idx  (0=2021, 1=2022, 2=2023, 3=2024)
-      64 aef_delta_vec  (emb_2024 - emb_2020, or nearest available)
-    ─────────────────────────────────────────
-      78 total features
+    Build (N, 149) feature matrix.
+    If rows/cols given, extracts only sampled pixels; otherwise flattens all.
     """
-    # Determine shape
-    any_emb = next(iter(aef_by_year.values()))   # (64, H, W)
-    _, H, W = any_emb.shape
+    any_emb  = next(iter(aef_by_year.values()))
+    _, H, W  = any_emb.shape
+    N        = len(rows) if rows is not None else H * W
 
-    if sample_rows is not None:
-        # Extract sampled pixels from each year: (64, N)
-        def _px(arr): return arr[:, sample_rows, sample_cols]
-        N = len(sample_rows)
-    else:
-        # Flatten all pixels: (64, H*W)
-        def _px(arr): return arr.reshape(64, -1)
-        N = H * W
+    def _px(arr2d: np.ndarray) -> np.ndarray:
+        """Extract sampled pixels or flatten."""
+        return arr2d[rows, cols] if rows is not None else arr2d.ravel()
 
-    emb: dict[int, np.ndarray] = {
-        yr: _px(cube) for yr, cube in aef_by_year.items()
-    }  # yr → (64, N)
+    def _px3(arr3d: np.ndarray) -> np.ndarray:
+        """(64, H, W) → (64, N)."""
+        return arr3d[:, rows, cols] if rows is not None else arr3d.reshape(64, -1)
 
-    feats = np.full((N, 78), np.nan, dtype=np.float32)
-    col = 0
+    emb: dict[int, np.ndarray] = {yr: _px3(cube) for yr, cube in aef_by_year.items()}
 
-    # ── year-over-year L2 delta ───────────────────────────────────────────────
-    l2_deltas = {}
-    for i, yr in enumerate(DELTA_YEARS):
+    feats = np.full((N, N_FEATURES), np.nan, dtype=np.float32)
+    c = 0
+
+    # ── AEF L2 deltas ─────────────────────────────────────────────────────────
+    l2_deltas: dict[int, np.ndarray] = {}
+    for yr in DELTA_YEARS:
         if yr in emb and (yr - 1) in emb:
-            diff = emb[yr] - emb[yr - 1]           # (64, N)
-            l2   = np.linalg.norm(diff, axis=0)    # (N,)
+            l2 = np.linalg.norm(emb[yr] - emb[yr - 1], axis=0)
         else:
             l2 = np.zeros(N, dtype=np.float32)
-        feats[:, col] = l2
-        l2_deltas[yr] = l2
-        col += 1
+        feats[:, c] = l2;  l2_deltas[yr] = l2;  c += 1
 
-    # ── year-over-year cosine delta ───────────────────────────────────────────
+    # ── AEF cosine deltas ─────────────────────────────────────────────────────
     for yr in DELTA_YEARS:
         if yr in emb and (yr - 1) in emb:
-            a  = emb[yr];    na = np.linalg.norm(a, axis=0) + 1e-9
-            b  = emb[yr-1];  nb = np.linalg.norm(b, axis=0) + 1e-9
-            cos_sim = (a * b).sum(axis=0) / (na * nb)
-            feats[:, col] = (1.0 - cos_sim).clip(0, 2)
-        col += 1
+            a = emb[yr];   na = np.linalg.norm(a, axis=0) + 1e-9
+            b = emb[yr-1]; nb = np.linalg.norm(b, axis=0) + 1e-9
+            feats[:, c] = (1.0 - (a * b).sum(axis=0) / (na * nb)).clip(0, 2)
+        c += 1
 
-    # ── cumulative L2 from 2020 baseline ─────────────────────────────────────
+    # ── cumulative L2 from 2020 ───────────────────────────────────────────────
     for yr in DELTA_YEARS:
         if yr in emb and 2020 in emb:
-            feats[:, col] = np.linalg.norm(emb[yr] - emb[2020], axis=0)
-        col += 1
+            feats[:, c] = np.linalg.norm(emb[yr] - emb[2020], axis=0)
+        c += 1
 
-    # ── max delta and argmax year ─────────────────────────────────────────────
-    l2_stack = np.stack([l2_deltas[yr] for yr in DELTA_YEARS], axis=0)  # (4, N)
-    feats[:, col]     = l2_stack.max(axis=0)
-    col += 1
-    feats[:, col]     = l2_stack.argmax(axis=0).astype(np.float32)
-    col += 1
+    # ── max delta + argmax year ───────────────────────────────────────────────
+    l2_stack = np.stack([l2_deltas[yr] for yr in DELTA_YEARS], axis=0)
+    feats[:, c] = l2_stack.max(axis=0);   c += 1
+    feats[:, c] = l2_stack.argmax(axis=0).astype(np.float32); c += 1
 
-    # ── 64-dim change vector: emb_latest - emb_2020 ──────────────────────────
-    latest_yr = max(yr for yr in aef_by_year if yr > 2020) if any(yr > 2020 for yr in aef_by_year) else None
-    if latest_yr is not None and 2020 in emb:
-        delta_vec = (emb[latest_yr] - emb[2020]).T   # (N, 64)
-        feats[:, col:col + 64] = delta_vec
-    col += 64
+    # ── AEF change vector: emb_latest − emb_2020 (64-dim) ────────────────────
+    latest = max((yr for yr in aef_by_year if yr > 2020), default=None)
+    if latest and 2020 in emb:
+        feats[:, c:c + 64] = (emb[latest] - emb[2020]).T
+    c += 64
 
-    assert col == 78, f"Feature count mismatch: {col}"
+    # ── NDVI features ─────────────────────────────────────────────────────────
+    for key in ("ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"):
+        if ndvi_sar and key in ndvi_sar:
+            feats[:, c] = _px(ndvi_sar[key])
+        c += 1
+
+    # ── SAR features ──────────────────────────────────────────────────────────
+    for key in ("sar_pre", "sar_post", "sar_change"):
+        if ndvi_sar and key in ndvi_sar:
+            feats[:, c] = _px(ndvi_sar[key])
+        c += 1
+
+    # ── AEF 2020 baseline embedding (64-dim) ──────────────────────────────────
+    if 2020 in emb:
+        feats[:, c:c + 64] = emb[2020].T
+    c += 64
+
+    assert c == N_FEATURES, f"Feature count mismatch: {c} != {N_FEATURES}"
     return feats
-
-
-FEATURE_NAMES = (
-    [f"aef_l2_delta_{yr}"      for yr in DELTA_YEARS] +
-    [f"aef_cos_delta_{yr}"     for yr in DELTA_YEARS] +
-    [f"aef_from2020_l2_{yr}"   for yr in DELTA_YEARS] +
-    ["aef_max_delta_l2", "aef_change_year_idx"] +
-    [f"aef_delta_vec_{i:02d}"  for i in range(64)]
-)
 
 
 # ── tile pixel sampling ───────────────────────────────────────────────────────
@@ -255,24 +354,19 @@ def sample_tile(
     mislabels: pd.DataFrame | None,
     n_sample: int = N_SAMPLE_PER_TILE,
     seed: int = 42,
+    verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """
-    Sample pixels from one training tile.
-    Returns (features, labels, year_labels) or None on failure.
 
-    Stratified: up to n_sample//2 positives + n_sample//2 negatives.
-    """
+    from mislabel_detection_v2 import load_tile
     rng = np.random.default_rng(seed)
 
     try:
         td = load_tile(tile_id)
     except FileNotFoundError as e:
-        print(f"  {tile_id}: SKIP — {e}")
+        if verbose: print(f"  {tile_id}: SKIP — {e}")
         return None
 
     H, W = td.ref_shape
-
-    # GT pixel labels
     tile_rows = (
         mislabels[mislabels["tile_id"] == tile_id].reset_index(drop=True)
         if mislabels is not None else None
@@ -285,60 +379,58 @@ def sample_tile(
     pos_idx = np.where(flat_gt == 1)[0]
     neg_idx = np.where(flat_gt == 0)[0]
 
+    if len(pos_idx) == 0:
+        if verbose: print(f"  {tile_id}: no positive pixels — SKIP")
+        return None
+
     n_pos = min(len(pos_idx), n_sample // 2)
     n_neg = min(len(neg_idx), n_sample - n_pos)
 
-    if n_pos == 0:
-        print(f"  {tile_id}: no positive pixels — SKIP")
-        return None
-
-    chosen_pos = rng.choice(pos_idx, n_pos, replace=False)
-    chosen_neg = rng.choice(neg_idx, n_neg, replace=False)
-    idx        = np.concatenate([chosen_pos, chosen_neg])
-
+    idx  = np.concatenate([
+        rng.choice(pos_idx, n_pos, replace=False),
+        rng.choice(neg_idx, n_neg, replace=False),
+    ])
     rows = (idx // W).astype(np.int32)
-    cols = (idx %  W).astype(np.int32)
+    cols_arr = (idx %  W).astype(np.int32)
 
-    # Load AEF all years
+    # AEF
     aef_by_year = load_aef_all_years(
         tile_id, "train", td.ref_transform, td.ref_crs, td.ref_shape
     )
     if not aef_by_year or 2020 not in aef_by_year:
-        print(f"  {tile_id}: missing 2020 AEF — SKIP")
+        if verbose: print(f"  {tile_id}: missing 2020 AEF — SKIP")
         return None
 
-    feats      = compute_pixel_features(aef_by_year, rows, cols)
-    labels     = flat_gt[idx].astype(np.int32)
-    year_labels = flat_year[idx].astype(np.int32)
+    # NDVI + SAR pixel maps
+    ndvi_sar = load_ndvi_sar_maps(
+        tile_id, "train", td.ref_transform, td.ref_crs, td.ref_shape
+    )
 
-    return feats, labels, year_labels
+    feats  = compute_pixel_features(aef_by_year, ndvi_sar, rows, cols_arr)
+    labels = flat_gt[idx].astype(np.int32)
+    yrs    = flat_year[idx].astype(np.int32)
+    return feats, labels, yrs
 
 
 # ── training ──────────────────────────────────────────────────────────────────
 
-def train(
-    mislabels_csv: Path,
-    out_dir: Path,
-    verbose: bool = True,
-) -> dict:
+def train(mislabels_csv: Path, out_dir: Path, verbose: bool = True) -> dict:
     mislabels = pd.read_csv(mislabels_csv)
     mislabels["flagged"] = mislabels["flagged"].astype(bool)
 
-    # Get training tiles
     meta_path = DATA_ROOT / "metadata" / "train_tiles.geojson"
     with open(meta_path) as f:
         gj = json.load(f)
     props = gj["features"][0]["properties"]
-    candidates = ["tile_id", "id", "name", "tile", "TILE_ID"]
-    key = next((k for k in candidates if k in props), list(props.keys())[0])
+    cands = ["tile_id", "id", "name", "tile", "TILE_ID"]
+    key   = next((k for k in cands if k in props), list(props.keys())[0])
     all_tiles = [feat["properties"][key] for feat in gj["features"]]
 
     if verbose:
         print(f"\n{'='*60}")
-        print(f"Pixel-Level LightGBM — {len(all_tiles)} training tile(s)")
+        print(f"Pixel LightGBM v2 — {len(all_tiles)} tiles, {N_FEATURES} features")
         print(f"{'='*60}\n")
 
-    # ── sample pixels from all training tiles ─────────────────────────────────
     tile_feats:  dict[str, np.ndarray] = {}
     tile_labels: dict[str, np.ndarray] = {}
     tile_years:  dict[str, np.ndarray] = {}
@@ -346,7 +438,7 @@ def train(
     for tile_id in all_tiles:
         if verbose:
             print(f"  Sampling {tile_id} …", end=" ", flush=True)
-        result = sample_tile(tile_id, mislabels)
+        result = sample_tile(tile_id, mislabels, verbose=verbose)
         if result is None:
             continue
         feats, labels, years = result
@@ -354,176 +446,155 @@ def train(
         tile_labels[tile_id] = labels
         tile_years[tile_id]  = years
         if verbose:
-            print(f"{len(labels)} pixels  (pos={labels.sum()}  neg={(labels==0).sum()})")
+            print(f"{len(labels)} px  (pos={labels.sum()}  neg={(labels==0).sum()})")
 
     sampled_tiles = list(tile_feats.keys())
     regions = {t: get_region(t) for t in sampled_tiles}
 
-    # ── per-region LOTO-CV then final model ───────────────────────────────────
     models:  dict[str, LGBMClassifier] = {}
     scalers: dict[str, RobustScaler]   = {}
-    global_model:  LGBMClassifier | None = None
-    global_scaler: RobustScaler   | None = None
-
-    loto_results: list[dict] = []
+    loto_rows: list[dict] = []
 
     for region in ["SEA", "SAM"]:
-        region_tiles = [t for t in sampled_tiles if regions[t] == region]
-        if not region_tiles:
+        rtiles = [t for t in sampled_tiles if regions[t] == region]
+        if not rtiles:
             continue
 
         if verbose:
-            print(f"\n  [{region}] {len(region_tiles)} tiles — LOTO-CV …")
+            print(f"\n  [{region}] LOTO-CV on {len(rtiles)} tiles …")
 
-        # LOTO cross-validation
-        oof_preds = {}
-        for held in region_tiles:
-            train_tiles = [t for t in region_tiles if t != held]
-            if not train_tiles:
+        oof_preds: dict[str, dict] = {}
+        for held in rtiles:
+            train_t = [t for t in rtiles if t != held]
+            if not train_t:
                 continue
 
-            X_tr = np.vstack([tile_feats[t]  for t in train_tiles])
-            y_tr = np.concatenate([tile_labels[t] for t in train_tiles])
+            X_tr = np.vstack([tile_feats[t]  for t in train_t])
+            y_tr = np.concatenate([tile_labels[t] for t in train_t])
             X_va = tile_feats[held]
             y_va = tile_labels[held]
 
-            # Impute NaN with column median from training data
-            col_medians = np.nanmedian(X_tr, axis=0)
-            col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
-            X_tr = np.where(np.isfinite(X_tr), X_tr, col_medians)
-            X_va = np.where(np.isfinite(X_va), X_va, col_medians)
+            med  = np.nanmedian(X_tr, axis=0)
+            med  = np.where(np.isfinite(med), med, 0.0)
+            X_tr = np.where(np.isfinite(X_tr), X_tr, med)
+            X_va = np.where(np.isfinite(X_va), X_va, med)
 
-            scaler = RobustScaler()
-            X_tr_s = scaler.fit_transform(X_tr)
-            X_va_s = scaler.transform(X_va)
+            sc   = RobustScaler()
+            clf  = LGBMClassifier(**LGBM_PARAMS)
+            clf.fit(sc.fit_transform(X_tr), y_tr)
+            p_va = clf.predict_proba(sc.transform(X_va))[:, 1]
 
-            clf = LGBMClassifier(**LGBM_PARAMS)
-            clf.fit(X_tr_s, y_tr)
-            p_va = clf.predict_proba(X_va_s)[:, 1]
-
-            # IoU-optimal threshold on validation fold
-            best_iou, best_thresh = 0.0, 0.5
-            for thresh in np.arange(0.15, 0.85, 0.01):
-                pred = (p_va >= thresh).astype(int)
-                iou  = compute_iou(y_va, pred)
+            # IoU-optimal threshold
+            best_iou, best_t = 0.0, 0.5
+            for t in np.arange(0.15, 0.85, 0.01):
+                iou = compute_iou(y_va, (p_va >= t).astype(int))
                 if iou > best_iou:
-                    best_iou, best_thresh = iou, thresh
+                    best_iou, best_t = iou, t
 
-            pred_best = (p_va >= best_thresh).astype(int)
+            pred = (p_va >= best_t).astype(int)
             oof_preds[held] = {
-                "iou":    compute_iou(y_va, pred_best),
-                "recall": compute_recall(y_va, pred_best),
-                "fpr":    compute_fpr(y_va, pred_best),
-                "thresh": best_thresh,
+                "iou": compute_iou(y_va, pred),
+                "recall": compute_recall(y_va, pred),
+                "fpr": compute_fpr(y_va, pred),
+                "thresh": best_t,
             }
-            loto_results.append({"tile": held, "region": region, **oof_preds[held]})
-
+            loto_rows.append({"tile": held, "region": region, **oof_preds[held]})
             if verbose:
                 r = oof_preds[held]
                 print(f"    {held}: IoU={r['iou']:.3f}  Recall={r['recall']:.3f}  "
                       f"FPR={r['fpr']:.3f}  thresh={r['thresh']:.2f}")
 
-        # Region summary
-        if oof_preds and verbose:
-            iou_vals = [v["iou"] for v in oof_preds.values()]
-            thresh_vals = [v["thresh"] for v in oof_preds.values()]
-            print(f"  [{region}] mean LOTO IoU: {np.mean(iou_vals):.3f}  "
-                  f"median thresh: {np.median(thresh_vals):.2f}")
+        # Median threshold for region
+        region_thresh = float(np.median([v["thresh"] for v in oof_preds.values()])) \
+            if oof_preds else 0.5
 
         # Final model on all region data
-        X_all = np.vstack([tile_feats[t]  for t in region_tiles])
-        y_all = np.concatenate([tile_labels[t] for t in region_tiles])
+        X_all = np.vstack([tile_feats[t]  for t in rtiles])
+        y_all = np.concatenate([tile_labels[t] for t in rtiles])
+        med   = np.nanmedian(X_all, axis=0)
+        med   = np.where(np.isfinite(med), med, 0.0)
+        X_all = np.where(np.isfinite(X_all), X_all, med)
 
-        col_medians = np.nanmedian(X_all, axis=0)
-        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
-        X_all = np.where(np.isfinite(X_all), X_all, col_medians)
+        sc_f  = RobustScaler()
+        clf_f = LGBMClassifier(**LGBM_PARAMS)
+        clf_f.fit(sc_f.fit_transform(X_all), y_all)
 
-        scaler_final = RobustScaler()
-        X_all_s = scaler_final.fit_transform(X_all)
+        sc_f.nan_fill_   = med
+        sc_f.threshold_  = region_thresh
+        models[region]   = clf_f
+        scalers[region]  = sc_f
 
-        clf_final = LGBMClassifier(**LGBM_PARAMS)
-        clf_final.fit(X_all_s, y_all)
+        if verbose and oof_preds:
+            iou_vals = [v["iou"] for v in oof_preds.values()]
+            print(f"  [{region}] mean LOTO IoU={np.mean(iou_vals):.3f}  "
+                  f"thresh={region_thresh:.2f}")
 
-        # Use median LOTO threshold for this region
-        region_thresholds = [v["thresh"] for v in oof_preds.values()] if oof_preds else [0.5]
-        region_thresh = float(np.median(region_thresholds))
-
-        models[region]  = clf_final
-        scalers[region] = scaler_final
-
-        # Store NaN-fill values (medians) with scaler
-        scaler_final.nan_fill_ = col_medians
-        scaler_final.threshold_ = region_thresh
-
-    # ── global fallback model (all regions) ───────────────────────────────────
-    X_g = np.vstack(list(tile_feats.values()))
-    y_g = np.concatenate(list(tile_labels.values()))
+    # Global fallback model
+    X_g   = np.vstack(list(tile_feats.values()))
+    y_g   = np.concatenate(list(tile_labels.values()))
     med_g = np.nanmedian(X_g, axis=0)
     med_g = np.where(np.isfinite(med_g), med_g, 0.0)
     X_g   = np.where(np.isfinite(X_g), X_g, med_g)
+    sc_g  = RobustScaler()
+    clf_g = LGBMClassifier(**LGBM_PARAMS)
+    clf_g.fit(sc_g.fit_transform(X_g), y_g)
+    sc_g.nan_fill_  = med_g
+    sc_g.threshold_ = 0.4
 
-    global_scaler = RobustScaler()
-    X_g_s = global_scaler.fit_transform(X_g)
-    global_model = LGBMClassifier(**LGBM_PARAMS)
-    global_model.fit(X_g_s, y_g)
-    global_scaler.nan_fill_ = med_g
-    global_scaler.threshold_ = 0.4   # conservative default
-
-    # ── LOTO summary ──────────────────────────────────────────────────────────
-    if verbose and loto_results:
-        ldf = pd.DataFrame(loto_results)
+    # Summary
+    if verbose and loto_rows:
+        ldf = pd.DataFrame(loto_rows)
         print(f"\n{'='*60}")
-        print("LOTO Pixel-Level Summary")
+        print("LOTO Pixel Summary")
         print(f"{'='*60}")
-        print(f"  Overall mean IoU   : {ldf['iou'].mean():.3f}")
-        print(f"  Overall mean Recall: {ldf['recall'].mean():.3f}")
-        print(f"  Overall mean FPR   : {ldf['fpr'].mean():.3f}")
+        print(f"  IoU    mean={ldf['iou'].mean():.3f}  min={ldf['iou'].min():.3f}  max={ldf['iou'].max():.3f}")
+        print(f"  Recall mean={ldf['recall'].mean():.3f}")
+        print(f"  FPR    mean={ldf['fpr'].mean():.3f}")
         for region in ldf["region"].unique():
             sub = ldf[ldf["region"] == region]
             print(f"  [{region}] IoU={sub['iou'].mean():.3f}  "
                   f"Recall={sub['recall'].mean():.3f}  FPR={sub['fpr'].mean():.3f}")
 
-    # ── save ──────────────────────────────────────────────────────────────────
+    # Feature importance
+    if verbose:
+        print(f"\n{'='*60}")
+        print("Top-15 Features by Region")
+        print(f"{'='*60}")
+        for region, model in models.items():
+            imp = pd.Series(model.feature_importances_, index=FEATURE_NAMES)
+            print(f"  [{region}]")
+            for feat, val in imp.nlargest(15).items():
+                print(f"    {feat:35s} {val:6.0f}")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     artifacts = {
-        "models":        models,
-        "scalers":       scalers,
-        "global_model":  global_model,
-        "global_scaler": global_scaler,
+        "models": models, "scalers": scalers,
+        "global_model": clf_g, "global_scaler": sc_g,
         "feature_names": FEATURE_NAMES,
     }
     model_path = out_dir / "pixel_model.pkl"
     joblib.dump(artifacts, model_path)
     if verbose:
         print(f"\nSaved → {model_path}")
-
     return artifacts
 
 
 # ── prediction ────────────────────────────────────────────────────────────────
 
 def predict_tile(
-    tile_id: str,
-    split: str,
-    artifacts: dict,
-    verbose: bool = True,
+    tile_id: str, split: str, artifacts: dict, verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, tuple, object, object] | None:
-    """
-    Predict deforestation for one tile at pixel level.
-    Returns (binary_map, year_map, ref_shape, ref_transform, ref_crs) or None.
-    """
+
     region = get_region(tile_id)
     model  = artifacts["models"].get(region, artifacts["global_model"])
     scaler = artifacts["scalers"].get(region, artifacts["global_scaler"])
     thresh = getattr(scaler, "threshold_", 0.4)
     nan_fill = getattr(scaler, "nan_fill_", None)
 
-    # Reference grid from S2
-    s2_dir = DATA_ROOT / "sentinel-2" / split / f"{tile_id}__s2_l2a"
+    s2_dir   = DATA_ROOT / "sentinel-2" / split / f"{tile_id}__s2_l2a"
     s2_files = sorted(s2_dir.glob("*.tif"))
     if not s2_files:
-        if verbose:
-            print(f"  {tile_id}: no S2 data — SKIP")
+        if verbose: print(f"  {tile_id}: no S2 — SKIP")
         return None
 
     with rasterio.open(s2_files[0]) as src:
@@ -533,60 +604,53 @@ def predict_tile(
 
     H, W = ref_shape
 
-    # Load AEF all years
-    aef_by_year = load_aef_all_years(
-        tile_id, split, ref_transform, ref_crs, ref_shape
-    )
+    aef_by_year = load_aef_all_years(tile_id, split, ref_transform, ref_crs, ref_shape)
     if not aef_by_year or 2020 not in aef_by_year:
-        if verbose:
-            print(f"  {tile_id}: missing AEF data — SKIP")
+        if verbose: print(f"  {tile_id}: missing AEF — SKIP")
         return None
 
-    # Compute pixel features for entire tile (flat)
-    feats = compute_pixel_features(aef_by_year)   # (H*W, 78)
+    ndvi_sar = load_ndvi_sar_maps(tile_id, split, ref_transform, ref_crs, ref_shape)
+
+    feats = compute_pixel_features(aef_by_year, ndvi_sar)   # (H*W, N_FEATURES)
 
     if nan_fill is not None:
-        mask_nan = ~np.isfinite(feats)
-        feats[mask_nan] = np.broadcast_to(nan_fill, feats.shape)[mask_nan]
+        feats = np.where(np.isfinite(feats), feats, nan_fill)
     else:
         feats = np.where(np.isfinite(feats), feats, 0.0)
 
-    # Predict in chunks to avoid memory spikes
+    # Predict in chunks
     CHUNK = 200_000
     proba = np.zeros(H * W, dtype=np.float32)
-    for start in range(0, H * W, CHUNK):
-        end = min(start + CHUNK, H * W)
-        chunk_s = scaler.transform(feats[start:end])
-        proba[start:end] = model.predict_proba(chunk_s)[:, 1]
+    for s in range(0, H * W, CHUNK):
+        e = min(s + CHUNK, H * W)
+        proba[s:e] = model.predict_proba(scaler.transform(feats[s:e]))[:, 1]
 
-    binary_map = (proba >= thresh).astype(np.uint8).reshape(H, W)
+    # Gaussian spatial smoothing — kills isolated-pixel FP
+    prob_map    = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
+    binary_map  = (prob_map >= thresh).astype(np.uint8)
 
-    # Year map: argmax AEF L2 delta (feature index 0-3 → year 2021-2024)
-    year_idx_flat = feats[:, 14].astype(np.int32).clip(0, 3)  # aef_change_year_idx
-    year_map = (year_idx_flat + 2021).astype(np.int16).reshape(H, W)
+    # Year: argmax AEF L2 delta (feature index 14 = aef_change_year_idx)
+    year_idx   = feats[:, 14].astype(np.int32).clip(0, 3)
+    year_map   = (year_idx + 2021).astype(np.int16).reshape(H, W)
     year_map[binary_map == 0] = 0
 
     if verbose:
         n_pos = binary_map.sum()
         print(f"  {tile_id} [{region}]: thresh={thresh:.2f}  "
-              f"defor_pixels={n_pos:,}  ({100*n_pos/(H*W):.2f}%)")
+              f"defor={n_pos:,}  ({100*n_pos/(H*W):.2f}%)")
 
     return binary_map, year_map, ref_shape, ref_transform, ref_crs
 
 
 def predict_all(
-    artifacts: dict,
-    out_dir: Path,
-    split: str = "test",
-    verbose: bool = True,
+    artifacts: dict, out_dir: Path, split: str = "test", verbose: bool = True,
 ) -> list[Path]:
-    # Get tile list
     meta = DATA_ROOT / "metadata" / f"{split}_tiles.geojson"
     with open(meta) as f:
         gj = json.load(f)
     props = gj["features"][0]["properties"]
-    candidates = ["tile_id", "id", "name", "tile", "TILE_ID"]
-    key = next((k for k in candidates if k in props), list(props.keys())[0])
+    cands = ["tile_id", "id", "name", "tile", "TILE_ID"]
+    key   = next((k for k in cands if k in props), list(props.keys())[0])
     tiles = [feat["properties"][key] for feat in gj["features"]]
 
     raster_dir = out_dir / "pixel_predictions"
@@ -602,27 +666,21 @@ def predict_all(
         result = predict_tile(tile_id, split, artifacts, verbose=verbose)
         if result is None:
             continue
-
         binary_map, year_map, ref_shape, ref_transform, ref_crs = result
-
         out_path = raster_dir / f"{tile_id}_prediction.tif"
+        yr_off = (year_map - 2020).clip(0, 255).astype(np.uint8)
         with rasterio.open(
             out_path, "w", driver="GTiff",
             height=ref_shape[0], width=ref_shape[1],
             count=2, dtype="uint8",
-            crs=ref_crs, transform=ref_transform,
-            compress="lzw",
+            crs=ref_crs, transform=ref_transform, compress="lzw",
         ) as dst:
             dst.write(binary_map, 1)
-            year_offset = (year_map - 2020).clip(0, 255).astype(np.uint8)
-            dst.write(year_offset, 2)
-            dst.update_tags(band_1="deforestation", band_2="year_offset_from_2020")
-
+            dst.write(yr_off, 2)
         written.append(out_path)
 
     if written:
         _build_submission(written, out_dir, verbose=verbose)
-
     return written
 
 
@@ -630,10 +688,9 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
     pieces = []
     for rpath in raster_paths:
         with rasterio.open(rpath) as src:
-            binary    = src.read(1).astype(np.uint8)
-            yr_offset = src.read(2).astype(np.uint8)
-            transform = src.transform
-            crs       = src.crs
+            binary = src.read(1).astype(np.uint8)
+            yr_off = src.read(2).astype(np.uint8)
+            transform, crs = src.transform, src.crs
 
         polygons, timesteps = [], []
         for geom_dict, val in shapes(binary, mask=binary, transform=transform):
@@ -643,20 +700,16 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
             cx, cy = geom.centroid.x, geom.centroid.y
             col = max(0, min(int((cx - transform.c) / transform.a), binary.shape[1] - 1))
             row = max(0, min(int((cy - transform.f) / transform.e), binary.shape[0] - 1))
-            yr  = int(yr_offset[row, col]) + 2020
-            yr  = max(2021, min(2024, yr))
+            yr  = max(2021, min(2024, int(yr_off[row, col]) + 2020))
             polygons.append(geom)
             timesteps.append(f"{yr % 100:02d}06")
 
         if not polygons:
             continue
-
         gdf = gpd.GeoDataFrame({"time_step": timesteps}, geometry=polygons, crs=crs)
         gdf = gdf.to_crs("EPSG:4326")
-
-        utm_crs = gdf.estimate_utm_crs()
-        gdf_utm = gdf.to_crs(utm_crs)
-        gdf     = gdf[gdf_utm.area / 10_000 >= 0.5].reset_index(drop=True)
+        utm = gdf.estimate_utm_crs()
+        gdf = gdf[(gdf.to_crs(utm).area / 10_000) >= 0.5].reset_index(drop=True)
         if not gdf.empty:
             pieces.append(gdf)
 
@@ -664,20 +717,19 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
         print("  No polygons above 0.5 ha.")
         return
 
-    submission = gpd.GeoDataFrame(pd.concat(pieces, ignore_index=True), crs="EPSG:4326")
-    out_path = out_dir / "submission.geojson"
-    submission.to_file(out_path, driver="GeoJSON")
-
+    sub = gpd.GeoDataFrame(pd.concat(pieces, ignore_index=True), crs="EPSG:4326")
+    out = out_dir / "submission.geojson"
+    sub.to_file(out, driver="GeoJSON")
     if verbose:
-        print(f"\n  Submission → {out_path}  ({len(submission)} polygons)")
-        for ts, cnt in submission["time_step"].value_counts().sort_index().items():
+        print(f"\n  Submission → {out}  ({len(sub)} polygons)")
+        for ts, cnt in sub["time_step"].value_counts().sort_index().items():
             print(f"    20{ts[:2]}-{ts[2:]}: {cnt}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Pixel-level LightGBM deforestation classifier")
+    p = argparse.ArgumentParser()
     p.add_argument("--mode",      choices=["train", "predict", "all"], default="all")
     p.add_argument("--mislabels", default="results/mislabels_v2.csv")
     p.add_argument("--out-dir",   default="results")
@@ -688,22 +740,18 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args    = _parse_args()
-    verbose = not args.quiet
     out_dir = Path(args.out_dir)
+    verbose = not args.quiet
 
     if args.mode in ("train", "all"):
-        artifacts = train(
-            mislabels_csv=Path(args.mislabels),
-            out_dir=out_dir,
-            verbose=verbose,
-        )
+        artifacts = train(Path(args.mislabels), out_dir, verbose)
 
     if args.mode in ("predict", "all"):
         if args.mode == "predict":
-            model_path = out_dir / "pixel_model.pkl"
-            if not model_path.exists():
-                sys.exit(f"No model at {model_path}. Run --mode train first.")
-            artifacts = joblib.load(model_path)
-        predict_all(artifacts, out_dir, split=args.split, verbose=verbose)
+            mp = out_dir / "pixel_model.pkl"
+            if not mp.exists():
+                sys.exit(f"No model at {mp}. Run --mode train first.")
+            artifacts = joblib.load(mp)
+        predict_all(artifacts, out_dir, args.split, verbose)
 
     print("\nDone.")
