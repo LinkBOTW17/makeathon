@@ -22,16 +22,12 @@ class OsapiensDataset(Dataset):
         self.seq_len = seq_len
         self.transform = transform
         
-        # Load tiles
-        metadata_path = self.data_root / "metadata" / f"{split}_tiles.geojson"
-        if metadata_path.exists():
-            with open(metadata_path, 'r') as f:
-                geo = json.load(f)
-                self.tiles = [feat['properties']['tile_id'] for feat in geo['features']]
-        else:
-            # Fallback: discover tile ids from s2 directory if geojson is missing
-            s2_dir = self.data_root / "sentinel-2" / split
-            self.tiles = [p.name.split("__")[0] for p in s2_dir.glob("*") if p.is_dir()]
+        # Load tiles dynamically from directory structure
+        s2_dir = self.data_root / "sentinel-2" / split
+        self.tiles = [p.name.split("__")[0] for p in s2_dir.glob("*") if p.is_dir()]
+        
+        if len(self.tiles) == 0:
+            print(f"WARNING: No tiles found in {s2_dir}. Ensure 'make download_data_from_s3' was completed successfully.")
             
         self.tiles = sorted(list(set(self.tiles)))
 
@@ -78,9 +74,15 @@ class OsapiensDataset(Dataset):
             # Attempt to find labels dynamically
             for lname in ["gladl", "glads2", "radd"]:
                 spec_dir = lbl_dir / lname
-                label_files = list(spec_dir.glob(f"*{tile_id}*.tif"))
+                # Gather all alert files, ignoring alertDate metadata rasters
+                label_files = [f for f in spec_dir.glob(f"*{tile_id}*.tif") if "alertDate" not in f.name]
+                
                 if label_files:
-                    labels[lname] = self._read_raster(label_files[0])
+                    # Some sources have multiple years (alert21, alert22, etc.). 
+                    # We compute the overall deforestation mask by taking the max across years.
+                    arrays = [self._read_raster(f) for f in label_files]
+                    stacked = np.stack(arrays, axis=0)
+                    labels[lname] = np.max(stacked, axis=0) # Cumulative mask
                 else:
                     labels[lname] = None
 
