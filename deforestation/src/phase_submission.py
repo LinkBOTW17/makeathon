@@ -58,27 +58,34 @@ _AEF_SCALE  = 127.5
 def dequantize_aef(raw: np.ndarray) -> np.ndarray:
     """
     Proper AEF dequantization: signed_square((raw - 127) / 127.5)
+    Only applied if the data is integer (uint8). Float data is returned as-is
+    (meaning it was already dequantized by the data provider).
+
     Also marks all-zero 64-band groups as NaN (NoData/ocean pixels).
-
-    raw : (64, H, W)  uint8 quantized
-    Returns (64, H, W) float32 with NoData pixels set to NaN.
+    raw : (64, H, W)
+    Returns (64, H, W) float32.
     """
-    out = raw.astype(np.float32)
+    # Mark NoData pixels (all 64 bands == 0 or NaN)
+    if np.issubdtype(raw.dtype, np.integer):
+        nodata = np.all(raw == 0, axis=0)               # (H, W)
+        out    = raw.astype(np.float32)
+        x      = (out - _AEF_OFFSET) / _AEF_SCALE
+        neg    = x < 0
+        out    = np.abs(x) ** 2
+        out    = np.where(neg, -out, out)                # signed square ∈ [-1, 1]
+        out[:, nodata] = np.nan
+    else:
+        # Already float (challenge AEF may ship pre-dequantized)
+        out    = raw.astype(np.float32)
+        nodata = np.all(~np.isfinite(out), axis=0)
+        out[:, nodata] = np.nan
 
-    # Mark pixels where all 64 bands are 0 → NoData
-    nodata = np.all(raw == 0, axis=0)  # (H, W)
-
-    x   = (out - _AEF_OFFSET) / _AEF_SCALE   # (64, H, W)
-    neg = x < 0
-    out = np.abs(x) ** 2                       # |x|²
-    out = np.where(neg, -out, out)             # signed square
-
-    out[:, nodata] = np.nan
     return out
 
 
 def build_forest_and_exclusion_masks(aef_raw: np.ndarray,
                                       ndvi_max_map: np.ndarray,
+                                      ndvi_valid_frac_map: np.ndarray,
                                       forest_ndvi_th: float) -> tuple:
     """
     Returns (forest_mask, exclusion_mask) both shape (H, W) bool.
@@ -86,29 +93,42 @@ def build_forest_and_exclusion_masks(aef_raw: np.ndarray,
     forest_mask    : pixel was forested → eligible for deforestation detection
     exclusion_mask : pixel is water/bare/NoData → NEVER deforestation
 
-    Uses AEF tree-cover dimensions (A16, A23) from proper dequantization
-    for a globally-valid forest prior that generalises across biomes.
-    Falls back to ndvi_max > forest_ndvi_th for any pixel with NaN AEF.
+    Critical: pixels with no cloud-free S2 observations (ndvi_valid_frac == 0)
+    have ndvi_max filled with 0.0 (not a real measurement). They must NOT be
+    filtered by the NDVI threshold — in cloudy regions (Amazon, SE Asia) this
+    would eliminate all genuine deforestation. For those pixels we fall through
+    to AEF or pass the mask to let XGBoost decide.
     """
     aef_deq = dequantize_aef(aef_raw)          # (64, H, W) float32
 
-    # NoData pixels (all-zero groups become NaN in every dimension)
+    # NoData pixels
     nodata_mask = np.all(~np.isfinite(aef_deq), axis=0)   # (H, W)
 
     # Tree cover: either A16 or A23 > 0 after dequantization
-    tree_dim_vals = np.nanmax(aef_deq[AEF_TREE_COVER_DIMS], axis=0)   # (H, W)
-    aef_tree      = tree_dim_vals > 0.0
+    with np.errstate(all="ignore"):
+        tree_dim_vals = np.nanmax(aef_deq[AEF_TREE_COVER_DIMS], axis=0)
+    aef_tree = np.where(np.isfinite(tree_dim_vals), tree_dim_vals > 0.0, False)
 
-    # Exclusion: water or bare or NoData
-    water_excl  = aef_deq[AEF_WATER_DIM] > 0.05        # (H, W)
-    bare_excl   = aef_deq[AEF_BARE_DIM]  > 0.05
-    buildup_val = np.nanmax(aef_deq[AEF_BUILDUP_DIMS], axis=0)
-    buildup_excl = buildup_val > 0.1
+    # Hard exclusions: permanent water, bare land, built-up, NoData
+    with np.errstate(all="ignore"):
+        water_val   = aef_deq[AEF_WATER_DIM]
+        bare_val    = aef_deq[AEF_BARE_DIM]
+        buildup_val = np.nanmax(aef_deq[AEF_BUILDUP_DIMS], axis=0)
+
+    water_excl   = np.where(np.isfinite(water_val),   water_val   > 0.10, False)
+    bare_excl    = np.where(np.isfinite(bare_val),     bare_val    > 0.10, False)
+    buildup_excl = np.where(np.isfinite(buildup_val),  buildup_val > 0.15, False)
     exclusion_mask = water_excl | bare_excl | buildup_excl | nodata_mask
 
-    # Forest mask: AEF says tree OR NDVI was ever high (handles pre-2022 deforestation)
-    ndvi_forest = ndvi_max_map > forest_ndvi_th
-    forest_mask = (aef_tree | ndvi_forest) & ~exclusion_mask
+    # NDVI forest signal — only valid when we have actual observations
+    has_ndvi_data = ndvi_valid_frac_map > 0.05   # ≥ 5% cloud-free observations
+    ndvi_forest   = has_ndvi_data & (ndvi_max_map > forest_ndvi_th)
+
+    # No NDVI data (fully cloud-masked): pass through to XGBoost result
+    no_ndvi_data  = ~has_ndvi_data
+
+    # Forest mask: AEF tree-cover OR NDVI evidence OR no NDVI data (cloudy region)
+    forest_mask = (aef_tree | ndvi_forest | no_ndvi_data) & ~exclusion_mask
 
     return forest_mask, exclusion_mask
 
@@ -385,11 +405,12 @@ def main():
         logger.info(f"[{tile_id}] Pre-filter positives: {int(binary.sum()):,}")
 
         # ── Forest + exclusion masks using AEF (globally valid) ───────────
-        ndvi_max_map = ndvi_stats["ndvi_max"].reshape(H, W)
+        ndvi_max_map       = ndvi_stats["ndvi_max"].reshape(H, W)
+        ndvi_valid_frac_map = ndvi_stats["ndvi_valid_frac"].reshape(H, W)
         forest_mask, exclusion_mask = build_forest_and_exclusion_masks(
-            aef_raw, ndvi_max_map, forest_ndvi_th
+            aef_raw, ndvi_max_map, ndvi_valid_frac_map, forest_ndvi_th
         )
-        binary = binary & forest_mask.astype(np.uint8) & ~exclusion_mask.astype(np.uint8)
+        binary = (binary.astype(bool) & forest_mask & ~exclusion_mask).astype(np.uint8)
         logger.info(f"[{tile_id}] After forest+exclusion mask: {int(binary.sum()):,}")
 
         # ── VV change-signal filter ────────────────────────────────────────
