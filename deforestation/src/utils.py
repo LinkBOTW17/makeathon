@@ -388,23 +388,32 @@ class DeforestationDataset:
         import torch
 
         i  = self.indices[idx]
-        s2 = self.s2_ts[i]           # (T, 2)
-        s1 = self.s1_ts[i]           # (T, 1)
+        s2 = self.s2_ts[i].copy()    # (T, 2)
+        s1 = self.s1_ts[i].copy()    # (T, 1)
         ts = np.concatenate([s2, s1], axis=1).astype(np.float32)  # (T, 3)
 
-        # Replace NaN (cloud / no-data) with 0 before normalisation
+        # Capture validity mask BEFORE any replacement — 1 = observed, 0 = missing
+        # This lets the model learn to down-weight cloud/no-data timesteps explicitly.
+        valid_mask = np.isfinite(ts).astype(np.float32)  # (T, 3)
+
+        # Normalise FIRST using training statistics
+        ts = (ts - self.ts_mean[None, :]) / (self.ts_std[None, :] + 1e-8)
+
+        # NOW replace NaN with 0 — in normalised space 0 == the mean (neutral signal).
+        # Replacing before normalisation maps NaN to (0-mean)/std ≈ -1.7 for NDVI,
+        # which falsely looks like a deforested pixel to the LSTM.
         ts = np.nan_to_num(ts, nan=0.0)
 
-        # Z-normalise per channel using training statistics
-        ts = (ts - self.ts_mean[None, :]) / (self.ts_std[None, :] + 1e-8)
+        # Append validity channels → (T, 6): [NDVI, NBR, VV, v_NDVI, v_NBR, v_VV]
+        ts = np.concatenate([ts, valid_mask], axis=1)
 
         aef = self.aef[i].astype(np.float32)
         aef = (aef - self.aef_mean) / (self.aef_std + 1e-8)
 
         return (
-            torch.tensor(ts,                       dtype=torch.float32),
-            torch.tensor(aef,                      dtype=torch.float32),
-            torch.tensor([self.labels[i]],         dtype=torch.float32),
+            torch.tensor(ts,               dtype=torch.float32),
+            torch.tensor(aef,              dtype=torch.float32),
+            torch.tensor([self.labels[i]], dtype=torch.float32),
         )
 
 
@@ -430,17 +439,20 @@ class DeforestationModel:
             def __init__(self):
                 super().__init__()
 
-                # Branch A: temporal encoder
-                # VV slope is dominant signal (Phase 3a showed #1 gain) —
-                # LSTM over full 72-step trajectory captures this far better
-                # than a single summary statistic.
+                # Branch A: temporal encoder with attention pooling.
+                # VV slope was the #1 XGBoost feature — the LSTM over the full
+                # 72-step trajectory learns its exact shape, not just a slope.
+                # Attention lets the model focus on the specific months when the
+                # deforestation event happened rather than averaging over all 72 steps.
                 self.lstm = nn.LSTM(
-                    input_size  = n_ts_features,
+                    input_size  = n_ts_features,   # 6: [NDVI, NBR, VV, v_NDVI, v_NBR, v_VV]
                     hidden_size = lstm_hidden,
                     num_layers  = lstm_layers,
                     batch_first = True,
                     dropout     = lstm_dropout if lstm_layers > 1 else 0.0,
                 )
+                # Additive attention: score each timestep output → weighted sum
+                self.attn_proj = nn.Linear(lstm_hidden, 1, bias=False)
 
                 # Branch B: AEF semantic projection
                 self.aef_proj = nn.Sequential(
@@ -459,13 +471,19 @@ class DeforestationModel:
                 self.head = nn.Sequential(*layers)
 
             def forward(self, ts, aef):
+                import torch.nn.functional as F
                 # ts:  (B, T, n_ts_features)
                 # aef: (B, aef_dim)
-                _, (h_n, _) = self.lstm(ts)
-                temporal_emb = h_n[-1]        # (B, lstm_hidden)
-                aef_emb      = self.aef_proj(aef)   # (B, 64)
-                fused        = torch.cat([temporal_emb, aef_emb], dim=1)
-                return self.head(fused)        # (B, 1) logits
+                lstm_out, _ = self.lstm(ts)                    # (B, T, lstm_hidden)
+
+                # Attention: soft-select the most informative timestep(s)
+                attn_scores  = self.attn_proj(lstm_out).squeeze(-1)   # (B, T)
+                attn_weights = F.softmax(attn_scores, dim=1)          # (B, T)
+                temporal_emb = (lstm_out * attn_weights.unsqueeze(-1)).sum(dim=1)  # (B, lstm_hidden)
+
+                aef_emb = self.aef_proj(aef)                          # (B, 64)
+                fused   = torch.cat([temporal_emb, aef_emb], dim=1)
+                return self.head(fused)                                # (B, 1) logits
 
         import torch  # noqa: F401 — ensures torch is importable before returning
         return _Model()

@@ -107,7 +107,7 @@ xgboost:
 # ─── Temporal model (Phase 3b) ────────────────────────────────────────────────
 model:
   aef_dim: 64
-  n_ts_features: 3        # NDVI, NBR, VV_dB
+  n_ts_features: 6        # NDVI, NBR, VV_dB  + 3 binary validity channels
   lstm_hidden: 64
   lstm_layers: 2
   lstm_dropout: 0.2

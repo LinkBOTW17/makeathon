@@ -281,20 +281,24 @@ def main():
     print(f"  AUC-PR  : {final_auc_pr:.4f}   ← primary metric")
 
     # ── Side-by-side comparison with Phase 3a ────────────────────────────
-    xgb_path = checkpoints / "xgboost_baseline.joblib"
+    xgb_art_path  = checkpoints / "xgboost_baseline.joblib"
+    xgb_pred_path = processed  / "baseline_val_predictions.parquet"
     print("\n── Model comparison ─────────────────────────────────────────────")
-    if xgb_path.exists():
-        xgb_art = joblib.load(xgb_path)
+    if xgb_art_path.exists() and xgb_pred_path.exists():
+        xgb_art     = joblib.load(xgb_art_path)
+        xgb_pred_df = pd.read_parquet(xgb_pred_path)
+        xgb_f1      = f1_score(xgb_pred_df["y_true"], xgb_pred_df["y_pred"],
+                               pos_label=1, zero_division=0)
         print(f"  {'Metric':<12}  {'XGBoost':>10}  {'LSTM+AEF':>10}  {'Delta':>8}")
-        print(f"  {'-'*48}")
-        print(f"  {'F1 (def)':<12}  {best_f1:>10.4f}  {final_f1:>10.4f}"
-              f"  {final_f1 - best_f1:>+8.4f}")
+        print(f"  {'-'*50}")
+        print(f"  {'F1 (def)':<12}  {xgb_f1:>10.4f}  {final_f1:>10.4f}"
+              f"  {final_f1 - xgb_f1:>+8.4f}")
         print(f"  {'AUC-ROC':<12}  {xgb_art['auc_roc']:>10.4f}  {final_auc_roc:>10.4f}"
               f"  {final_auc_roc - xgb_art['auc_roc']:>+8.4f}")
         print(f"  {'AUC-PR':<12}  {xgb_art['auc_pr']:>10.4f}  {final_auc_pr:>10.4f}"
               f"  {final_auc_pr - xgb_art['auc_pr']:>+8.4f}")
     else:
-        logger.warning("XGBoost artifact not found — skipping comparison table")
+        logger.warning("XGBoost artifacts not found — skipping comparison table")
 
     # ── Save model ────────────────────────────────────────────────────────
     model_path = checkpoints / "temporal_model_best.pt"
