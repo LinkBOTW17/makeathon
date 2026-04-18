@@ -93,6 +93,22 @@ split:
   val_tiles:  ["18NXH_6_8"]    # South America — medium-sized, has all 3 label sources
   test_tiles: ["47QMB_0_8"]    # SE Asia — different region, OOD test in Phase 4
 
+# ─── Test set paths (mirror of train paths) ───────────────────────────────────
+paths_test:
+  s2:  "{data_root}/sentinel-2/test"
+  s1:  "{data_root}/sentinel-1/test"
+  aef: "{data_root}/aef-embeddings/test"
+
+# ─── Submission ───────────────────────────────────────────────────────────────
+submission:
+  output_dir: "data/submission"
+  probability_threshold: 0.35   # updated by phase_ensemble_threshold.py
+  min_area_pixels: 5            # filter isolated single-pixel noise
+  # Year prediction: find the S1 VV timestep with the largest single-step drop.
+  # For post-2020 constraint: only consider months from 2020-01 onwards.
+  year_pred_start_year: 2020
+  fallback_year: 2022           # used when no valid VV drop is detected
+
 # ─── XGBoost baseline (Phase 3a) ──────────────────────────────────────────────
 xgboost:
   n_estimators: 500

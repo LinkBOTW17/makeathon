@@ -34,6 +34,8 @@ def load_config(config_path: str = "configs/config.yaml") -> dict:
         return obj
 
     cfg["paths"] = _resolve(cfg["paths"])
+    if "paths_test" in cfg:
+        cfg["paths_test"] = _resolve(cfg["paths_test"])
     return cfg
 
 
