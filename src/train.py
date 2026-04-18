@@ -79,8 +79,8 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     
     dataset = OsapiensDataset(data_root=DATA_ROOT, split="train", seq_len=12)
-    # Tuned for 192GB VRAM and 20 vCPUs
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=16, pin_memory=True, collate_fn=pad_collate_fn)
+    # Scaled down batch_size for 1024x1024 time-series imagery to fit 192GB VRAM limits!
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=16, pin_memory=True, collate_fn=pad_collate_fn)
     
     print("Auto-detecting channel dimensions from the first batch...")
     first_batch = next(iter(dataloader))
