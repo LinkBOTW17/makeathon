@@ -580,6 +580,7 @@ def compute_suspicion_scores(
             random_state=42,
             n_jobs=-1,
         )
+        iso.fit(aef_scaled)
         # anomaly_score: more negative = more anomalous → invert so higher = worse
         raw_scores = iso.score_samples(aef_scaled)
         # normalise to [0, 1]
