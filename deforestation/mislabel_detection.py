@@ -219,11 +219,25 @@ def load_tile(tile_id: str, split: str = "train", years: list[int] | None = None
 
     labels_root = DATA_ROOT / "labels" / "train"
 
+    def _reproject_label(src_path: Path, band: int = 1) -> np.ndarray:
+        """Read a label band and reproject it onto the reference (S2) grid."""
+        out = np.zeros(td.ref_shape, dtype=np.float32)
+        with rasterio.open(src_path) as src:
+            reproject(
+                source=src.read(band).astype(np.float32),
+                destination=out,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=td.ref_transform,
+                dst_crs=td.ref_crs,
+                resampling=Resampling.nearest,
+            )
+        return out
+
     # RADD: leading digit 2/3 = alert; post-2020 = days >= 1827
     radd_path = labels_root / "radd" / f"radd_{tile_id}_labels.tif"
     if radd_path.exists():
-        raw, _ = _read_band(radd_path)
-        # leading digit determines confidence; remaining digits = days offset
+        raw = _reproject_label(radd_path)
         conf = (raw // 10000).astype(np.int32)
         days = (raw % 10000).astype(np.int32)
         td.radd_binary = ((conf >= 2) & (days >= 1827)).astype(np.uint8)
@@ -232,9 +246,9 @@ def load_tile(tile_id: str, split: str = "train", years: list[int] | None = None
     gs2_alert_path = labels_root / "glads2" / f"glads2_{tile_id}_alert.tif"
     gs2_date_path  = labels_root / "glads2" / f"glads2_{tile_id}_alertDate.tif"
     if gs2_alert_path.exists():
-        raw_alert, _ = _read_band(gs2_alert_path)
+        raw_alert = _reproject_label(gs2_alert_path)
         if gs2_date_path.exists():
-            raw_date, _ = _read_band(gs2_date_path)
+            raw_date = _reproject_label(gs2_date_path)
             td.glads2_binary = ((raw_alert >= 2) & (raw_date > 365)).astype(np.uint8)
         else:
             td.glads2_binary = (raw_alert >= 2).astype(np.uint8)
@@ -248,7 +262,7 @@ def load_tile(tile_id: str, split: str = "train", years: list[int] | None = None
             gladl_dir / tile_id / f"gladl_{tile_id}_alert{yy}.tif",
         ]:
             if candidate.exists():
-                raw, _ = _read_band(candidate)
+                raw = _reproject_label(candidate)
                 gladl_layers.append((raw >= 2).astype(np.uint8))
                 break
 
