@@ -102,10 +102,12 @@ paths_test:
 # ─── Submission ───────────────────────────────────────────────────────────────
 submission:
   output_dir: "data/submission"
-  probability_threshold: 0.55   # XGBoost-optimal from threshold sweep (IoU=0.3428)
-  min_area_pixels: 5            # filter isolated single-pixel noise
+  probability_threshold: 0.60   # increased from 0.55 to reduce OOD false positives
+  min_area_ha: 0.5              # official submission_utils default (0.5 ha ≈ 50 pixels at 10m)
+  forest_ndvi_threshold: 0.35   # only predict deforestation where ndvi_max > this
+  vv_change_threshold: -1.5     # only predict where max VV drop < this (dB)
+  max_year: 2024                # cap year predictions at 2024
   # Year prediction: find the S1 VV timestep with the largest single-step drop.
-  # For post-2020 constraint: only consider months from 2020-01 onwards.
   year_pred_start_year: 2020
   fallback_year: 2022           # used when no valid VV drop is detected
 
