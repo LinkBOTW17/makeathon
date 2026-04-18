@@ -61,7 +61,14 @@ if __name__ == "__main__":
     print("Loading test dataset...")
     dataset = OsapiensDataset(data_root=DATA_ROOT, split="test", seq_len=12)
     
-    model = FusionNet(s1_channels=2, s2_channels=10, aef_channels=768, num_classes=1).to(device)
+    # Auto-detect channels to match train.py dynamically
+    print("Auto-detecting channel dimensions from test set...")
+    first_sample = dataset[0]
+    s1_dim = first_sample["s1"].shape[1] if first_sample["s1"].nelement() > 0 else 2
+    s2_dim = first_sample["s2"].shape[1] if first_sample["s2"].nelement() > 0 else 10
+    aef_dim = first_sample["aef"].shape[0] if first_sample["aef"].nelement() > 0 else 768
+    
+    model = FusionNet(s1_channels=s1_dim, s2_channels=s2_dim, aef_channels=aef_dim, num_classes=1).to(device)
     # model.load_state_dict(torch.load("checkpoints/model_epoch_X.pt")) # Load best checkpoint here
     
     pbar = tqdm(dataset, desc="Running Inference")

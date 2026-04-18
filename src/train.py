@@ -67,6 +67,13 @@ def pad_collate_fn(batch):
     return collated
 
 if __name__ == "__main__":
+    import torch.backends.cudnn as cudnn
+    
+    # AMD ROCm Stability Fixes
+    # Disables the MIOpen kernel autotuner that causes "Workspace ... is not allocated" warnings
+    cudnn.benchmark = False
+    cudnn.deterministic = True
+
     DATA_ROOT = "data/makeathon-challenge/" # Adjust relative path
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
