@@ -62,9 +62,8 @@ if __name__ == "__main__":
     
     # We create the dataset with a sequence length of 12 (approx 1 year dataset)
     dataset = OsapiensDataset(data_root=DATA_ROOT, split="train", seq_len=12)
-    # The user has 192GB VRAM! We can afford a HUGE batch size. 
-    # But let's keep it safe at 16 for typical 3D dataloaders, then tune up.
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=8, pin_memory=True)
+    # Tuned for 192GB VRAM and 20 vCPUs
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=16, pin_memory=True)
     
     model = FusionNet(s1_channels=2, s2_channels=10, aef_channels=768, num_classes=1).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
