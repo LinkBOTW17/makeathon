@@ -284,34 +284,45 @@ def extract_full_tile_features(tile_id: str, cfg: dict, is_test: bool = True):
             s1_files, vv_cube, ndvi_stats, vv_stats, aef_raw)
 
 
-def predict_year_vectorized(vv_cube: np.ndarray, s1_files: list,
+def predict_yymm_vectorized(vv_cube: np.ndarray, s1_files: list,
                              start_year: int, fallback_year: int,
                              max_year: int = 2024) -> np.ndarray:
     """
-    Per-pixel year of largest VV-dB single-step drop in [start_year, max_year].
-    Returns (H, W) int32 array.
+    Per-pixel YYMM code of the largest VV-dB single-step drop in
+    [start_year, max_year].  YYMM = (year % 100) * 100 + month
+    e.g. April 2022 → 2204.  Required format by the scorer.
+    Returns (H, W) int32 array of YYMM codes.
     """
     T, H, W = vv_cube.shape
-    years   = np.array([yr for yr, _, _ in s1_files], dtype=np.int32)
+    years  = np.array([yr for yr, _,  _ in s1_files], dtype=np.int32)
+    months = np.array([mo for _,  mo, _ in s1_files], dtype=np.int32)
 
     post_mask = (years >= start_year) & (years <= max_year)
     post_idx  = np.where(post_mask)[0]
 
-    if len(post_idx) < 2:
-        return np.full((H, W), fallback_year, dtype=np.int32)
+    fallback_yymm = int((fallback_year % 100) * 100 + 6)   # June of fallback year
 
-    diff_cube  = np.diff(vv_cube[post_idx], axis=0)         # (K-1, H, W)
-    diff_years = years[post_idx[1:]]
+    if len(post_idx) < 2:
+        return np.full((H, W), fallback_yymm, dtype=np.int32)
+
+    diff_cube   = np.diff(vv_cube[post_idx], axis=0)        # (K-1, H, W)
+    # Use the endpoint of each diff as the event timestep
+    diff_years  = years[post_idx[1:]]
+    diff_months = months[post_idx[1:]]
 
     filled     = np.where(np.isfinite(diff_cube), diff_cube, np.inf)
     drop_t_idx = np.argmin(filled, axis=0)                   # (H, W)
 
-    year_map   = diff_years[drop_t_idx]
-    any_valid  = np.isfinite(diff_cube).any(axis=0)
-    year_map   = np.where(any_valid, year_map, fallback_year)
-    year_map   = np.clip(year_map, start_year, max_year)
+    year_map  = diff_years[drop_t_idx]
+    month_map = diff_months[drop_t_idx]
 
-    return year_map.astype(np.int32)
+    any_valid = np.isfinite(diff_cube).any(axis=0)
+    year_map  = np.where(any_valid, year_map,  fallback_year)
+    month_map = np.where(any_valid, month_map, 6)
+    year_map  = np.clip(year_map, start_year, max_year)
+
+    yymm_map = (year_map % 100) * 100 + month_map
+    return yymm_map.astype(np.int32)
 
 
 def filter_polygons_by_area(shapes_list: list, crs,
@@ -422,18 +433,18 @@ def main():
             logger.warning(f"[{tile_id}] No deforestation after filters — skipping")
             continue
 
-        # ── Year prediction ────────────────────────────────────────────────
-        year_map = predict_year_vectorized(
+        # ── YYMM prediction (scorer format: e.g. 2204 = April 2022) ─────────
+        yymm_map = predict_yymm_vectorized(
             vv_cube, s1_files,
             start_year=sub_cfg["year_pred_start_year"],
             fallback_year=sub_cfg["fallback_year"],
             max_year=max_year,
         )
-        year_map = np.where(binary, year_map, 0).astype(np.int32)
+        yymm_map = np.where(binary, yymm_map, 0).astype(np.int32)
 
         # ── Write per-tile rasters ─────────────────────────────────────────
         pred_raster_path = out_dir / f"pred_{tile_id}.tif"
-        year_raster_path = out_dir / f"year_{tile_id}.tif"
+        yymm_raster_path = out_dir / f"yymm_{tile_id}.tif"
 
         meta = dict(driver="GTiff", dtype="uint8", count=1,
                     height=H, width=W, crs=crs, transform=transform,
@@ -441,10 +452,10 @@ def main():
         with rasterio.open(pred_raster_path, "w", **meta) as dst:
             dst.write(binary, 1)
 
-        with rasterio.open(year_raster_path, "w", **{**meta, "dtype": "int32"}) as dst:
-            dst.write(year_map, 1)
+        with rasterio.open(yymm_raster_path, "w", **{**meta, "dtype": "int32"}) as dst:
+            dst.write(yymm_map, 1)
 
-        # ── Vectorise → area filter → per-polygon year ────────────────────
+        # ── Vectorise → area filter → per-polygon YYMM ────────────────────
         shapes_list = [
             (gd, int(v))
             for gd, v in rio_features.shapes(binary, mask=binary, transform=transform)
@@ -462,7 +473,7 @@ def main():
             logger.warning(f"[{tile_id}] All polygons < {min_area_ha} ha — skipping")
             continue
 
-        # Vectorised mode-year per polygon
+        # Vectorised mode-YYMM per polygon
         poly_id_raster = np.zeros((H, W), dtype=np.int32)
         for pid, (gd, _) in enumerate(shapes_list, start=1):
             rio_features.rasterize([(gd, pid)], out_shape=(H, W),
@@ -470,26 +481,26 @@ def main():
                                    merge_alg=rio_features.MergeAlg.replace)
 
         flat_ids   = poly_id_raster[binary == 1].ravel()
-        flat_years = year_map[binary == 1].ravel()
-        valid_mask = flat_years > 0
+        flat_yymm  = yymm_map[binary == 1].ravel()
+        valid_mask = flat_yymm > 0
 
         if valid_mask.any():
-            yr_df      = pd.DataFrame({"pid": flat_ids[valid_mask],
-                                       "year": flat_years[valid_mask]})
-            mode_years = (yr_df.groupby("pid")["year"]
+            yymm_df    = pd.DataFrame({"pid": flat_ids[valid_mask],
+                                       "yymm": flat_yymm[valid_mask]})
+            mode_yymm  = (yymm_df.groupby("pid")["yymm"]
                           .agg(lambda x: int(x.mode().iloc[0]))
                           .to_dict())
         else:
-            mode_years = {}
+            mode_yymm = {}
 
-        fallback = int(sub_cfg["fallback_year"])
+        fallback_yymm = int((sub_cfg["fallback_year"] % 100) * 100 + 6)
         for pid, (gd, _) in enumerate(shapes_list, start=1):
             all_geojson_features.append({
                 "type": "Feature",
                 "geometry": shapely.geometry.mapping(shapely.geometry.shape(gd)),
                 "properties": {
                     "tile_id":   tile_id,
-                    "time_step": mode_years.get(pid, fallback),
+                    "time_step": mode_yymm.get(pid, fallback_yymm),
                 },
             })
 
@@ -515,7 +526,7 @@ def main():
     except Exception:
         pass
 
-    year_counts = gdf_4326["time_step"].value_counts().sort_index()
+    yymm_counts = gdf_4326["time_step"].value_counts().sort_index()
 
     print("\n── Submission summary ───────────────────────────────────────────")
     print(f"  Tiles processed      : {len(test_tiles)}")
@@ -525,9 +536,11 @@ def main():
     print(f"  Forest mask          : AEF tree-cover (A16/A23) | ndvi_max > {forest_ndvi_th}")
     print(f"  VV change filter     : vv_max_drop < {vv_drop_th} dB")
     print(f"  Min area             : {min_area_ha} ha (UTM)")
-    print(f"  Year distribution (time_step):")
-    for yr, cnt in year_counts.items():
-        print(f"    {yr}: {cnt:,} polygons")
+    print(f"  time_step format     : YYMM (e.g. 2204 = April 2022)")
+    print(f"  YYMM distribution (top 10):")
+    for yymm, cnt in yymm_counts.head(10).items():
+        yy = yymm // 100;  mm = yymm % 100
+        print(f"    20{yy:02d}-{mm:02d}: {cnt:,} polygons")
     print(f"\n✓ Saved → {submission_path}")
     print("\nDONE — Submission generation complete.")
 
