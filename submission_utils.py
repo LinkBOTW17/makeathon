@@ -104,3 +104,39 @@ def raster_to_geojson(
             json.dump(geojson, f)
 
     return geojson
+
+if __name__ == "__main__":
+    import argparse
+    import glob
+
+    parser = argparse.ArgumentParser(description="Convert prediction rasters to submission GeoJSON.")
+    parser.add_argument("--input_dir", type=str, required=True, help="Directory containing prediction .tif files.")
+    parser.add_argument("--output_geojson", type=str, required=True, help="Output GeoJSON path.")
+    parser.add_argument("--min_area", type=float, default=0.5, help="Minimum polygon area in ha.")
+    
+    args = parser.parse_args()
+    
+    input_path = Path(args.input_dir)
+    output_path = Path(args.output_geojson)
+    
+    all_features = []
+    
+    # Process every .tif raster in the input directory
+    for f in input_path.glob("*.tif"):
+        print(f"Processing {f.name}...")
+        try:
+            fc = raster_to_geojson(f, min_area_ha=args.min_area)
+            all_features.extend(fc["features"])
+        except ValueError as e:
+            print(f"  Skipped {f.name}: {e}")
+            
+    final_geojson = {
+        "type": "FeatureCollection",
+        "features": all_features
+    }
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(final_geojson, f)
+        
+    print(f"\\nSuccessfully wrote {len(all_features)} deforestation polygons to {output_path}!")
