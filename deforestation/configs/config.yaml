@@ -85,6 +85,14 @@ feature_extraction:
   # S1 orbit to use
   s1_orbit: ascending
 
+# ─── Train / val / test tile split ───────────────────────────────────────────
+# Never split a single tile across sets — always assign whole tiles.
+# val_tiles   : used for early stopping & in-distribution evaluation
+# test_tiles  : fully held-out for Phase 4 OOD (out-of-distribution) evaluation
+split:
+  val_tiles:  ["18NXH_6_8"]    # South America — medium-sized, has all 3 label sources
+  test_tiles: ["47QMB_0_8"]    # SE Asia — different region, OOD test in Phase 4
+
 # ─── XGBoost baseline (Phase 3a) ──────────────────────────────────────────────
 xgboost:
   n_estimators: 500
