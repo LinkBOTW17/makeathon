@@ -103,7 +103,9 @@ class OsapiensDataset(Dataset):
                     aligned_arrays = self._align_arrays(arrays)
                     year_stack = np.stack(aligned_arrays, axis=0)
                     cumulative = np.max(year_stack, axis=0) 
-                    source_masks.append(cumulative[0]) 
+                    # Alert rasters can store date-like positive values rather than binary 0/1 masks.
+                    # Convert them to a boolean presence mask before combining sources.
+                    source_masks.append((cumulative[0] > 0).astype(np.float32)) 
             
             if source_masks:
                 aligned_sources = self._align_arrays([np.expand_dims(sm, axis=0) for sm in source_masks])
