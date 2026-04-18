@@ -589,9 +589,11 @@ def compute_suspicion_scores(
         df["score_anomaly"] = norm
 
         # KNN for suggested label correction (bonus)
-        knn = KNeighborsClassifier(n_neighbors=5, metric="euclidean")
-        knn.fit(aef_scaled, df["label"].values)
-        df["knn_label"] = knn.predict(aef_scaled)
+        n_neighbors = min(5, len(aef_scaled))
+        if n_neighbors >= 1:
+            knn = KNeighborsClassifier(n_neighbors=n_neighbors, metric="euclidean")
+            knn.fit(aef_scaled, df["label"].values)
+            df["knn_label"] = knn.predict(aef_scaled)
 
     # ── Combined suspicion score ──────────────────────────────────────────────
     w_disagree  = 0.50   # strongest signal: sources disagree
@@ -779,6 +781,8 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"  SKIP {tile}: {e}")
         if all_results:
+            # Reproject all results to EPSG:4326 before concat to unify CRS across UTM zones
+            all_results = [r.to_crs("EPSG:4326") for r in all_results]
             combined = pd.concat(all_results, ignore_index=True)
             out = Path(args.output)
             out.parent.mkdir(parents=True, exist_ok=True)
