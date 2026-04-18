@@ -1,0 +1,90 @@
+# ─── All paths are relative to the deforestation/ project root ───────────────
+# Run scripts from the deforestation/ directory: python src/phase1_label_fusion.py
+
+data_root: "../data/makeathon-challenge"
+
+paths:
+  # Sentinel-2: <tile>__s2_l2a/<tile>__s2_l2a_<year>_<month>.tif  (12 bands)
+  s2: "{data_root}/sentinel-2/train"
+  # Sentinel-1: <tile>__s1_rtc/<tile>__s1_rtc_<year>_<month>_ascending.tif  (1 band VV)
+  s1: "{data_root}/sentinel-1/train"
+  # AEF embeddings: <tile>_<year>.tiff  (64 bands)
+  aef: "{data_root}/aef-embeddings/train"
+  labels:
+    radd:   "{data_root}/labels/train/radd"    # radd_<tile>_labels.tif
+    gladl:  "{data_root}/labels/train/gladl"   # <tile>/alert<YY>.tif  OR  gladl_<tile>_alert<YY>.tif
+    glads2: "{data_root}/labels/train/glads2"  # glads2_<tile>_alert.tif  OR  <tile>/alert.tif
+  processed:   "data/processed"
+  checkpoints: "data/checkpoints"
+
+# ─── Label fusion ─────────────────────────────────────────────────────────────
+label_fusion:
+  # RADD: value encodes confidence + days since 2014-12-31
+  #   leading digit: 2=low conf, 3=high conf
+  #   remaining digits: days since 2014-12-31
+  #   2020-01-01 = day 1827 since 2014-12-31
+  radd_min_days_post2020: 1827
+  radd_min_confidence: 2          # include both low (2) and high (3) confidence
+
+  # GLAD-L: per-year alert rasters (alertYY.tif); 0=no loss, 2=probable, 3=confirmed
+  gladl_years: [21, 22, 23, 24]   # 2021-2024 (post-2020)
+  gladl_min_confidence: 2         # 2=probable loss and above
+
+  # GLAD-S2: single raster; 0=no loss, 1-4 increasing confidence
+  #   alertDate days offset from 2019-01-01; 2020-01-01 = day 366
+  glads2_min_days_post2020: 366
+  glads2_min_confidence: 2        # 2=low confidence and above
+
+  # Fusion
+  majority_threshold: 2           # >= 2 of 3 sources must agree for fused_label=1
+  uncertain_threshold: 0.10       # run cleanlab if uncertain pixels > 10% of total
+
+  # Sampling: how many negatives to sample per positive pixel
+  neg_sample_ratio: 3
+  neg_sample_seed: 42
+
+# ─── Sentinel-2 band indices (1-based rasterio band numbers) ──────────────────
+s2_bands:
+  B2:  1    # Blue         490 nm
+  B3:  2    # Green        560 nm
+  B4:  3    # Red          665 nm
+  B5:  4    # Red Edge 1   705 nm
+  B6:  5    # Red Edge 2   740 nm
+  B7:  6    # Red Edge 3   783 nm
+  B8:  7    # NIR          842 nm
+  B8A: 8    # Narrow NIR   865 nm
+  B9:  9    # Water Vapour 945 nm
+  B11: 10   # SWIR1        1610 nm
+  B12: 11   # SWIR2        2190 nm
+  SCL: 12   # Scene Classification
+
+# ─── Sentinel-1 band indices (1-based) ───────────────────────────────────────
+s1_bands:
+  VV: 1
+
+# ─── AEF embeddings ───────────────────────────────────────────────────────────
+aef:
+  n_bands: 64
+  year: 2022    # embeddings generated for full-year 2022 window
+
+# ─── XGBoost baseline (Phase 3a) ──────────────────────────────────────────────
+xgboost:
+  n_estimators: 500
+  early_stopping_rounds: 50
+  eval_metric: ["logloss", "aucpr"]
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 5
+
+# ─── Temporal model (Phase 3b) ────────────────────────────────────────────────
+model:
+  aef_dim: 64
+  lstm_hidden: 64
+  mlp_layers: [128, 64, 32]
+  learning_rate: 0.001
+  max_epochs: 100
+  patience: 10
+  lr_scheduler_patience: 5
+  batch_size: 256
