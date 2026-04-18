@@ -4,10 +4,14 @@ Submission Generation
 For every test tile:
   1. Extracts static features for ALL pixels (vectorized, no sampling)
   2. Runs XGBoost inference with the optimised probability threshold
-  3. Applies forest pre-filter (ndvi_max > 0.35) and VV change signal filter
-  4. Predicts deforestation YEAR per pixel from max VV-dB drop after 2020
-  5. Writes binary prediction raster + year raster as GeoTIFFs
-  6. Converts to GeoJSON polygons (min_area_ha=0.5) with a "time_step" property
+  3. Applies post-processing filters:
+       - Forest pre-filter: AEF tree-cover dims (A16/A23) + ndvi_max > 0.35
+       - AEF validity mask: exclude all-zero AEF pixels (ocean/NoData)
+       - AEF non-forest exclusion: water (A64) and bare (A63) pixels
+       - VV change signal: vv_max_drop < vv_change_threshold
+  4. Filters polygons < 0.5 ha (official submission_utils default)
+  5. Predicts deforestation YEAR (time_step) per polygon from max VV-dB drop
+  6. Writes binary prediction + year rasters and combined submission.geojson
 
 Run from the deforestation/ directory:
     python src/phase_submission.py
@@ -28,8 +32,6 @@ import geopandas as gpd
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))  # for submission_utils
-
 from utils import (
     get_logger, load_config,
     discover_s2_files, discover_s1_files, find_aef_file, normalize_aef,
@@ -40,36 +42,105 @@ logger = get_logger(__name__)
 
 SCL_VALID = {2, 4, 5, 6, 7, 11}
 
+# AEF dimension indices (0-based) from alphaearth_workshop.ipynb cell 25
+# Notation is 1-based (A16 = index 15), values are from proper dequantization
+AEF_TREE_COVER_DIMS = [15, 22]       # A16, A23 → Tree cover (forest)
+AEF_WATER_DIM       = 63             # A64      → Permanent water bodies
+AEF_BARE_DIM        = 62             # A63      → Bare/sparse vegetation
+AEF_BUILDUP_DIMS    = [8, 34]        # A09, A35 → Built-up
+AEF_CROPLAND_DIMS   = [11, 49]       # A12, A50 → Cropland
 
-# ─── Vectorized feature extraction for a full tile ────────────────────────────
+# Dequantization constants from alphaearth_workshop.ipynb
+_AEF_OFFSET = 127.0
+_AEF_SCALE  = 127.5
+
+
+def dequantize_aef(raw: np.ndarray) -> np.ndarray:
+    """
+    Proper AEF dequantization: signed_square((raw - 127) / 127.5)
+    Also marks all-zero 64-band groups as NaN (NoData/ocean pixels).
+
+    raw : (64, H, W)  uint8 quantized
+    Returns (64, H, W) float32 with NoData pixels set to NaN.
+    """
+    out = raw.astype(np.float32)
+
+    # Mark pixels where all 64 bands are 0 → NoData
+    nodata = np.all(raw == 0, axis=0)  # (H, W)
+
+    x   = (out - _AEF_OFFSET) / _AEF_SCALE   # (64, H, W)
+    neg = x < 0
+    out = np.abs(x) ** 2                       # |x|²
+    out = np.where(neg, -out, out)             # signed square
+
+    out[:, nodata] = np.nan
+    return out
+
+
+def build_forest_and_exclusion_masks(aef_raw: np.ndarray,
+                                      ndvi_max_map: np.ndarray,
+                                      forest_ndvi_th: float) -> tuple:
+    """
+    Returns (forest_mask, exclusion_mask) both shape (H, W) bool.
+
+    forest_mask    : pixel was forested → eligible for deforestation detection
+    exclusion_mask : pixel is water/bare/NoData → NEVER deforestation
+
+    Uses AEF tree-cover dimensions (A16, A23) from proper dequantization
+    for a globally-valid forest prior that generalises across biomes.
+    Falls back to ndvi_max > forest_ndvi_th for any pixel with NaN AEF.
+    """
+    aef_deq = dequantize_aef(aef_raw)          # (64, H, W) float32
+
+    # NoData pixels (all-zero groups become NaN in every dimension)
+    nodata_mask = np.all(~np.isfinite(aef_deq), axis=0)   # (H, W)
+
+    # Tree cover: either A16 or A23 > 0 after dequantization
+    tree_dim_vals = np.nanmax(aef_deq[AEF_TREE_COVER_DIMS], axis=0)   # (H, W)
+    aef_tree      = tree_dim_vals > 0.0
+
+    # Exclusion: water or bare or NoData
+    water_excl  = aef_deq[AEF_WATER_DIM] > 0.05        # (H, W)
+    bare_excl   = aef_deq[AEF_BARE_DIM]  > 0.05
+    buildup_val = np.nanmax(aef_deq[AEF_BUILDUP_DIMS], axis=0)
+    buildup_excl = buildup_val > 0.1
+    exclusion_mask = water_excl | bare_excl | buildup_excl | nodata_mask
+
+    # Forest mask: AEF says tree OR NDVI was ever high (handles pre-2022 deforestation)
+    ndvi_forest = ndvi_max_map > forest_ndvi_th
+    forest_mask = (aef_tree | ndvi_forest) & ~exclusion_mask
+
+    return forest_mask, exclusion_mask
+
+
+# ─── Vectorized feature extraction ───────────────────────────────────────────
 
 def _ts_stats_vectorized(ts_hw: np.ndarray, prefix: str) -> dict:
-    """Compute temporal statistics for a (T, H, W) time-series cube."""
+    """Temporal statistics for a (T, H, W) cube. Returns {prefix_stat: (H, W)}."""
     T, H, W = ts_hw.shape
     valid    = np.isfinite(ts_hw)
     n_valid  = valid.sum(axis=0).astype(np.float32)
 
     with np.errstate(all="ignore"):
-        mean_v  = np.nanmean(ts_hw, axis=0)
-        std_v   = np.nanstd(ts_hw,  axis=0)
-        min_v   = np.nanmin(ts_hw,  axis=0)
-        max_v   = np.nanmax(ts_hw,  axis=0)
+        mean_v = np.nanmean(ts_hw, axis=0)
+        std_v  = np.nanstd(ts_hw,  axis=0)
+        min_v  = np.nanmin(ts_hw,  axis=0)
+        max_v  = np.nanmax(ts_hw,  axis=0)
 
     valid_frac = n_valid / T
+    diffs      = np.diff(ts_hw, axis=0)
+    max_drop   = np.nanmin(diffs, axis=0)
 
-    diffs    = np.diff(ts_hw, axis=0)
-    max_drop = np.nanmin(diffs, axis=0)
+    t_vals = np.arange(T, dtype=np.float32)[:, None, None]
+    t_w    = np.where(valid, t_vals, np.nan)
+    v_w    = np.where(valid, ts_hw,  np.nan)
+    n_safe = np.where(n_valid >= 3, n_valid, np.nan)
 
-    t_vals   = np.arange(T, dtype=np.float32)[:, None, None]
-    t_w      = np.where(valid, t_vals, np.nan)
-    v_w      = np.where(valid, ts_hw,  np.nan)
-    n_safe   = np.where(n_valid >= 3, n_valid, np.nan)
-
-    t_mean   = np.nansum(t_w, axis=0) / n_safe
-    v_mean   = np.nansum(v_w, axis=0) / n_safe
-    cov      = np.nansum((t_w - t_mean[None]) * (v_w - v_mean[None]), axis=0) / n_safe
-    var_t    = np.nansum((t_w - t_mean[None]) ** 2, axis=0) / n_safe + 1e-8
-    slope    = np.where(n_valid >= 3, cov / var_t, np.nan)
+    t_mean = np.nansum(t_w, axis=0) / n_safe
+    v_mean = np.nansum(v_w, axis=0) / n_safe
+    cov    = np.nansum((t_w - t_mean[None]) * (v_w - v_mean[None]), axis=0) / n_safe
+    var_t  = np.nansum((t_w - t_mean[None]) ** 2, axis=0) / n_safe + 1e-8
+    slope  = np.where(n_valid >= 3, cov / var_t, np.nan)
 
     def _fill(a):
         return np.nan_to_num(a, nan=0.0).astype(np.float32)
@@ -85,9 +156,12 @@ def _ts_stats_vectorized(ts_hw: np.ndarray, prefix: str) -> dict:
     }
 
 
-def extract_full_tile_features(tile_id: str, cfg: dict,
-                                is_test: bool = True):
-    """Build (H*W, 85) feature matrix for an entire tile."""
+def extract_full_tile_features(tile_id: str, cfg: dict, is_test: bool = True):
+    """
+    Build (H*W, 85) feature matrix for an entire tile.
+    Returns: (feat_matrix, transform, crs, H, W, feat_cols,
+              s1_files, vv_cube, ndvi_stats, vv_stats, aef_raw)
+    """
     fe      = cfg["feature_extraction"]
     aef_cfg = cfg["aef"]
 
@@ -104,15 +178,15 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
         return None
 
     with rasterio.open(aef_path) as src:
-        aef_raw   = src.read()
+        aef_raw   = src.read()          # (64, H, W) uint8 — keep raw for dequantize
         transform = src.transform
         crs       = src.crs
         H, W      = src.height, src.width
 
-    aef_data = normalize_aef(aef_raw)
+    aef_data = normalize_aef(aef_raw)   # (64, H, W) float32 — used for XGBoost features
     logger.info(f"[{tile_id}] Grid: {H}×{W} = {H*W:,} pixels")
 
-    # ── S2 NDVI + NBR time series cube ────────────────────────────────────
+    # ── S2 NDVI + NBR cubes ───────────────────────────────────────────────
     s2_files  = discover_s2_files(str(s2_dir))
     T_s2      = len(s2_files)
     ndvi_cube = np.full((T_s2, H, W), np.nan, dtype=np.float32)
@@ -125,8 +199,7 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
                     data = src.read(
                         [fe["s2_red_band"], fe["s2_nir_band"],
                          fe["s2_swir2_band"], fe["s2_scl_band"]],
-                        out_shape=(4, H, W),
-                        resampling=Resampling.bilinear,
+                        out_shape=(4, H, W), resampling=Resampling.bilinear,
                     ).astype(np.float32)
                 else:
                     data = src.read(
@@ -134,7 +207,7 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
                          fe["s2_swir2_band"], fe["s2_scl_band"]]
                     ).astype(np.float32)
         except Exception as e:
-            logger.warning(f"[{tile_id}] S2 {year}-{month:02d} read error: {e}")
+            logger.warning(f"[{tile_id}] S2 {year}-{month:02d} error: {e}")
             continue
 
         red   = data[0] / fe["s2_scale_factor"]
@@ -143,16 +216,14 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
         scl   = data[3]
         valid_scl = np.isin(scl.astype(np.int32), fe["scl_valid_values"])
 
-        ndvi = spectral_index(nir, red)
-        nbr  = spectral_index(nir, swir2)
-        ndvi_cube[t_idx] = np.where(valid_scl, ndvi, np.nan)
-        nbr_cube[t_idx]  = np.where(valid_scl, nbr,  np.nan)
+        ndvi_cube[t_idx] = np.where(valid_scl, spectral_index(nir, red),  np.nan)
+        nbr_cube[t_idx]  = np.where(valid_scl, spectral_index(nir, swir2), np.nan)
 
     ndvi_stats = _ts_stats_vectorized(ndvi_cube, "ndvi")
     nbr_stats  = _ts_stats_vectorized(nbr_cube,  "nbr")
     logger.info(f"[{tile_id}] S2 done ({T_s2} months)")
 
-    # ── S1 VV-dB time series cube ─────────────────────────────────────────
+    # ── S1 VV-dB cube ─────────────────────────────────────────────────────
     s1_files = discover_s1_files(str(s1_dir), fe["s1_orbit"])
     T_s1     = len(s1_files)
     vv_cube  = np.full((T_s1, H, W), np.nan, dtype=np.float32)
@@ -166,7 +237,7 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
                 else:
                     vv = src.read(1).astype(np.float32)
         except Exception as e:
-            logger.warning(f"[{tile_id}] S1 {year}-{month:02d} read error: {e}")
+            logger.warning(f"[{tile_id}] S1 {year}-{month:02d} error: {e}")
             continue
 
         if fe["s1_db_conversion"]:
@@ -178,7 +249,7 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
     vv_stats = _ts_stats_vectorized(vv_cube, "vv")
     logger.info(f"[{tile_id}] S1 done ({T_s1} months)")
 
-    # ── Assemble feature matrix ───────────────────────────────────────────
+    # ── Feature matrix (H*W, 85) ──────────────────────────────────────────
     feature_parts = {}
     for i in range(64):
         feature_parts[f"aef_{i}"] = aef_data[i].ravel()
@@ -189,72 +260,70 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
     feat_matrix  = np.stack(list(feature_parts.values()), axis=1)
     feature_cols = list(feature_parts.keys())
 
-    return feat_matrix, transform, crs, H, W, feature_cols, s1_files, vv_cube, ndvi_stats, vv_stats
+    return (feat_matrix, transform, crs, H, W, feature_cols,
+            s1_files, vv_cube, ndvi_stats, vv_stats, aef_raw)
 
 
 def predict_year_vectorized(vv_cube: np.ndarray, s1_files: list,
-                             ndvi_stats: dict,
                              start_year: int, fallback_year: int,
                              max_year: int = 2024) -> np.ndarray:
     """
-    For each pixel, find the year of the largest single-step VV-dB drop
-    after start_year, capped at max_year.
+    Per-pixel year of largest VV-dB single-step drop in [start_year, max_year].
+    Returns (H, W) int32 array.
     """
     T, H, W = vv_cube.shape
     years   = np.array([yr for yr, _, _ in s1_files], dtype=np.int32)
 
-    post2020_mask = (years >= start_year) & (years <= max_year)
-    post2020_idx  = np.where(post2020_mask)[0]
+    post_mask = (years >= start_year) & (years <= max_year)
+    post_idx  = np.where(post_mask)[0]
 
-    if len(post2020_idx) < 2:
+    if len(post_idx) < 2:
         return np.full((H, W), fallback_year, dtype=np.int32)
 
-    diff_cube  = np.diff(vv_cube[post2020_idx], axis=0)
-    diff_years = years[post2020_idx[1:]]
+    diff_cube  = np.diff(vv_cube[post_idx], axis=0)         # (K-1, H, W)
+    diff_years = years[post_idx[1:]]
 
-    diff_cube_filled = np.where(np.isfinite(diff_cube), diff_cube, np.inf)
-    drop_t_idx = np.argmin(diff_cube_filled, axis=0)
+    filled     = np.where(np.isfinite(diff_cube), diff_cube, np.inf)
+    drop_t_idx = np.argmin(filled, axis=0)                   # (H, W)
 
-    year_map  = diff_years[drop_t_idx]
-    any_valid = np.isfinite(diff_cube).any(axis=0)
-    year_map  = np.where(any_valid, year_map, fallback_year)
-
-    # Cap at max_year
-    year_map = np.clip(year_map, start_year, max_year)
+    year_map   = diff_years[drop_t_idx]
+    any_valid  = np.isfinite(diff_cube).any(axis=0)
+    year_map   = np.where(any_valid, year_map, fallback_year)
+    year_map   = np.clip(year_map, start_year, max_year)
 
     return year_map.astype(np.int32)
 
 
+def filter_polygons_by_area(shapes_list: list, crs,
+                             min_area_ha: float) -> list:
+    """
+    Filter out polygons with UTM area < min_area_ha.
+    Returns filtered list of (geom_dict, value) tuples.
+    """
+    if not shapes_list:
+        return []
+
+    geoms = [shapely.geometry.shape(gd) for gd, _ in shapes_list]
+    gdf   = gpd.GeoDataFrame(geometry=geoms, crs=crs)
+
+    # Reproject to UTM for metric-accurate area
+    utm_crs  = gdf.estimate_utm_crs()
+    gdf_utm  = gdf.to_crs(utm_crs)
+    keep_idx = (gdf_utm.area / 10_000 >= min_area_ha)
+
+    return [shapes_list[i] for i, keep in enumerate(keep_idx) if keep]
+
+
 def discover_test_tiles(cfg: dict) -> list:
-    """Find test tile IDs from the AEF test directory."""
     aef_test_dir = Path(cfg["paths_test"]["aef"])
-    year = cfg["aef"]["year"]
+    year  = cfg["aef"]["year"]
     tiles = []
-    for f in sorted(aef_test_dir.glob(f"*_{year}.tiff")) + sorted(aef_test_dir.glob(f"*_{year}.tif")):
+    for f in sorted(aef_test_dir.glob(f"*_{year}.tiff")) + \
+             sorted(aef_test_dir.glob(f"*_{year}.tif")):
         stem    = f.stem
         tile_id = stem[:-(len(str(year)) + 1)]
         tiles.append(tile_id)
     return sorted(set(tiles))
-
-
-def min_area_ha_filter(binary: np.ndarray, transform, crs,
-                       min_area_ha: float) -> np.ndarray:
-    """Zero out connected components smaller than min_area_ha hectares."""
-    from scipy.ndimage import label as nd_label
-    labeled, n_feat = nd_label(binary)
-    if n_feat == 0:
-        return binary
-
-    # Pixel area in m² (assumes projected CRS in metres)
-    px_area_m2 = abs(transform.a * transform.e)
-    min_px = int(np.ceil((min_area_ha * 10_000) / px_area_m2))
-
-    out = binary.copy()
-    for comp_id in range(1, n_feat + 1):
-        mask = labeled == comp_id
-        if mask.sum() < min_px:
-            out[mask] = 0
-    return out
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -271,19 +340,21 @@ def main():
     vv_drop_th     = float(sub_cfg.get("vv_change_threshold", -1.5))
     max_year       = int(sub_cfg.get("max_year", 2024))
 
-    ckpt_dir       = Path(cfg["paths"]["checkpoints"])
-    model_art      = joblib.load(ckpt_dir / "xgboost_baseline.joblib")
-    model          = model_art["model"]
+    ckpt_dir        = Path(cfg["paths"]["checkpoints"])
+    model_art       = joblib.load(ckpt_dir / "xgboost_baseline.joblib")
+    model           = model_art["model"]
     train_feat_cols = model_art["feature_cols"]
 
     logger.info(f"Loaded XGBoost model | threshold={threshold:.2f}")
-    logger.info(f"Forest NDVI threshold : {forest_ndvi_th}")
-    logger.info(f"VV change threshold   : {vv_drop_th} dB")
-    logger.info(f"Min area              : {min_area_ha} ha")
+    logger.info(f"Forest NDVI threshold : ndvi_max > {forest_ndvi_th}")
+    logger.info(f"VV change threshold   : vv_max_drop < {vv_drop_th} dB")
+    logger.info(f"Min area filter       : {min_area_ha} ha (UTM-projected)")
+    logger.info(f"Year cap              : {max_year}")
+    logger.info(f"AEF tree-cover dims   : {[d+1 for d in AEF_TREE_COVER_DIMS]} (A-notation)")
 
     test_tiles = discover_test_tiles(cfg)
     if not test_tiles:
-        logger.error("No test tiles found. Check paths_test.aef in config.yaml.")
+        logger.error("No test tiles found — check paths_test.aef in config.yaml.")
         sys.exit(1)
     logger.info(f"Test tiles ({len(test_tiles)}): {test_tiles}")
 
@@ -295,7 +366,8 @@ def main():
         if result is None:
             continue
 
-        feat_matrix, transform, crs, H, W, feat_cols, s1_files, vv_cube, ndvi_stats, vv_stats = result
+        (feat_matrix, transform, crs, H, W, feat_cols,
+         s1_files, vv_cube, ndvi_stats, vv_stats, aef_raw) = result
 
         # ── Align feature columns to training order ────────────────────────
         col_to_idx = {c: i for i, c in enumerate(feat_cols)}
@@ -306,67 +378,70 @@ def main():
             continue
         X = feat_matrix[:, ordered_idx].astype(np.float32)
 
-        # ── Inference ──────────────────────────────────────────────────────
+        # ── XGBoost inference ─────────────────────────────────────────────
         logger.info(f"[{tile_id}] Running XGBoost on {H*W:,} pixels …")
         probs  = model.predict_proba(X)[:, 1]
         binary = (probs >= threshold).astype(np.uint8).reshape(H, W)
+        logger.info(f"[{tile_id}] Pre-filter positives: {int(binary.sum()):,}")
 
-        # ── Forest pre-filter: only predict in pixels that were forested ────
+        # ── Forest + exclusion masks using AEF (globally valid) ───────────
         ndvi_max_map = ndvi_stats["ndvi_max"].reshape(H, W)
-        forest_mask  = ndvi_max_map > forest_ndvi_th
-        binary       = binary & forest_mask.astype(np.uint8)
+        forest_mask, exclusion_mask = build_forest_and_exclusion_masks(
+            aef_raw, ndvi_max_map, forest_ndvi_th
+        )
+        binary = binary & forest_mask.astype(np.uint8) & ~exclusion_mask.astype(np.uint8)
+        logger.info(f"[{tile_id}] After forest+exclusion mask: {int(binary.sum()):,}")
 
-        # ── VV change-signal filter: require meaningful SAR backscatter drop ─
-        vv_drop_map  = vv_stats["vv_max_drop"].reshape(H, W)
-        change_mask  = vv_drop_map < vv_drop_th
-        binary       = binary & change_mask.astype(np.uint8)
+        # ── VV change-signal filter ────────────────────────────────────────
+        vv_drop_map = vv_stats["vv_max_drop"].reshape(H, W)
+        binary      = binary & (vv_drop_map < vv_drop_th).astype(np.uint8)
+        logger.info(f"[{tile_id}] After VV change filter: {int(binary.sum()):,}")
 
-        # ── Remove small polygons (< min_area_ha) ─────────────────────────
-        binary = min_area_ha_filter(binary, transform, crs, min_area_ha)
-
-        n_def = int(binary.sum())
-        logger.info(f"[{tile_id}] After filters: {n_def:,} deforestation pixels "
-                    f"({100*n_def/(H*W):.2f}%)")
-
-        if n_def == 0:
-            logger.warning(f"[{tile_id}] No deforestation predicted — skipping")
+        if int(binary.sum()) == 0:
+            logger.warning(f"[{tile_id}] No deforestation after filters — skipping")
             continue
 
         # ── Year prediction ────────────────────────────────────────────────
         year_map = predict_year_vectorized(
-            vv_cube, s1_files, ndvi_stats,
+            vv_cube, s1_files,
             start_year=sub_cfg["year_pred_start_year"],
             fallback_year=sub_cfg["fallback_year"],
             max_year=max_year,
         )
         year_map = np.where(binary, year_map, 0).astype(np.int32)
 
-        # ── Write rasters ──────────────────────────────────────────────────
+        # ── Write per-tile rasters ─────────────────────────────────────────
         pred_raster_path = out_dir / f"pred_{tile_id}.tif"
         year_raster_path = out_dir / f"year_{tile_id}.tif"
 
         meta = dict(driver="GTiff", dtype="uint8", count=1,
                     height=H, width=W, crs=crs, transform=transform,
                     compress="lzw")
-
         with rasterio.open(pred_raster_path, "w", **meta) as dst:
             dst.write(binary, 1)
 
-        meta_year = {**meta, "dtype": "int32"}
-        with rasterio.open(year_raster_path, "w", **meta_year) as dst:
+        with rasterio.open(year_raster_path, "w", **{**meta, "dtype": "int32"}) as dst:
             dst.write(year_map, 1)
 
-        # ── Polygon vectorisation + per-polygon time_step assignment ────────
-        shapes_list = [(gd, int(v))
-                       for gd, v in rio_features.shapes(binary, mask=binary,
-                                                         transform=transform)
-                       if int(v) > 0]
-
+        # ── Vectorise → area filter → per-polygon year ────────────────────
+        shapes_list = [
+            (gd, int(v))
+            for gd, v in rio_features.shapes(binary, mask=binary, transform=transform)
+            if int(v) > 0
+        ]
         if not shapes_list:
-            logger.warning(f"[{tile_id}] shapes() returned no polygons")
+            logger.warning(f"[{tile_id}] shapes() returned nothing")
             continue
 
-        # Burn unique polygon ID for vectorised year aggregation
+        # Official area filter: remove polygons < min_area_ha (uses UTM projection)
+        shapes_list = filter_polygons_by_area(shapes_list, crs, min_area_ha)
+        logger.info(f"[{tile_id}] After {min_area_ha} ha area filter: {len(shapes_list)} polygons")
+
+        if not shapes_list:
+            logger.warning(f"[{tile_id}] All polygons < {min_area_ha} ha — skipping")
+            continue
+
+        # Vectorised mode-year per polygon
         poly_id_raster = np.zeros((H, W), dtype=np.int32)
         for pid, (gd, _) in enumerate(shapes_list, start=1):
             rio_features.rasterize([(gd, pid)], out_shape=(H, W),
@@ -376,6 +451,7 @@ def main():
         flat_ids   = poly_id_raster[binary == 1].ravel()
         flat_years = year_map[binary == 1].ravel()
         valid_mask = flat_years > 0
+
         if valid_mask.any():
             yr_df      = pd.DataFrame({"pid": flat_ids[valid_mask],
                                        "year": flat_years[valid_mask]})
@@ -387,21 +463,19 @@ def main():
 
         fallback = int(sub_cfg["fallback_year"])
         for pid, (gd, _) in enumerate(shapes_list, start=1):
-            geom = shapely.geometry.shape(gd)
-            predicted_year = mode_years.get(pid, fallback)
             all_geojson_features.append({
                 "type": "Feature",
-                "geometry": shapely.geometry.mapping(geom),
+                "geometry": shapely.geometry.mapping(shapely.geometry.shape(gd)),
                 "properties": {
                     "tile_id":   tile_id,
-                    "time_step": predicted_year,   # scorer expects "time_step"
+                    "time_step": mode_years.get(pid, fallback),
                 },
             })
 
-        logger.info(f"[{tile_id}] Polygons: {len(shapes_list)}")
+        logger.info(f"[{tile_id}] Final polygons: {len(shapes_list)}")
 
     if not all_geojson_features:
-        logger.error("No predictions generated.")
+        logger.error("No predictions generated — check data paths and thresholds.")
         sys.exit(1)
 
     gdf = gpd.GeoDataFrame.from_features(all_geojson_features)
@@ -412,6 +486,7 @@ def main():
     submission_path = out_dir / "submission.geojson"
     gdf_4326.to_file(submission_path, driver="GeoJSON")
 
+    # ── Summary ───────────────────────────────────────────────────────────
     area_ha = 0.0
     try:
         gdf_utm = gdf_4326.to_crs(gdf_4326.estimate_utm_crs())
@@ -426,9 +501,9 @@ def main():
     print(f"  Total polygons       : {len(gdf_4326):,}")
     print(f"  Total predicted area : {area_ha:.1f} ha")
     print(f"  Threshold            : {threshold:.2f}")
-    print(f"  Forest NDVI filter   : ndvi_max > {forest_ndvi_th}")
+    print(f"  Forest mask          : AEF tree-cover (A16/A23) | ndvi_max > {forest_ndvi_th}")
     print(f"  VV change filter     : vv_max_drop < {vv_drop_th} dB")
-    print(f"  Min area             : {min_area_ha} ha")
+    print(f"  Min area             : {min_area_ha} ha (UTM)")
     print(f"  Year distribution (time_step):")
     for yr, cnt in year_counts.items():
         print(f"    {yr}: {cnt:,} polygons")
