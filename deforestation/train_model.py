@@ -99,7 +99,9 @@ def get_region(tile_id: str) -> str:
     for region, prefixes in REGIONS.items():
         if prefix in prefixes:
             return region
-    return "UNK"
+    # Unknown region — fall back to whichever trained region has the closest
+    # median AEF change distribution (resolved at predict time via scorer params)
+    return "SAM"   # conservative default; SAM has higher FPR tolerance
 
 
 def compute_polygon_iou(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -542,15 +544,17 @@ def predict_tile_pixels(
     year_map    = np.array(year_keys, dtype=np.int16)[year_idx]            # (H, W)
 
     # ── normalise and threshold ───────────────────────────────────────────────
-    flat_scores   = max_delta.ravel()
-    p_aef_pixels  = aef_scorer.transform_array(flat_scores, region).reshape(H, W)
-    thresh        = tuner.threshold.get(region, 0.5)
-    # Use AEF-only threshold: since α was tuned for full ensemble,
-    # apply a small correction (AEF tends to need slightly higher threshold alone)
-    aef_alpha     = tuner.alpha.get(region, 0.5)
-    # Effective threshold for AEF-only signal
-    eff_thresh    = thresh / (aef_alpha + 1e-9) * aef_alpha   # re-scale by α contribution
-    eff_thresh    = float(np.clip(eff_thresh, 0.2, 0.8))
+    flat_scores  = max_delta.ravel()
+    p_aef_pixels = aef_scorer.transform_array(flat_scores, region).reshape(H, W)
+
+    # The ensemble threshold was tuned for:
+    #   P_ens = α·P_aef + (1-α)·P_lgbm  ≥ thresh
+    # At test time we only have P_aef. Assuming P_lgbm ≈ 0 for uncertain pixels
+    # (conservative), the equivalent AEF-only threshold is thresh / α.
+    # Clamp to [0.35, 0.80] to prevent extreme values for edge-case α.
+    aef_alpha  = tuner.alpha.get(region, 0.5)
+    raw_thresh = tuner.threshold.get(region, 0.5)
+    eff_thresh = float(np.clip(raw_thresh / (aef_alpha + 1e-6), 0.35, 0.80))
 
     binary_map = (p_aef_pixels >= eff_thresh).astype(np.uint8)
 
