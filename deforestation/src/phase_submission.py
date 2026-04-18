@@ -156,8 +156,11 @@ def extract_full_tile_features(tile_id: str, cfg: dict,
             logger.warning(f"[{tile_id}] S2 {year}-{month:02d} read error: {e}")
             continue
 
-        red, nir, swir2, scl = (data[i] / fe["s2_scale_factor"] for i in range(3)), data[3]
-        red, nir, swir2 = list(red)
+        # Unpack individually — a generator in a tuple unpack gives ValueError
+        red   = data[0] / fe["s2_scale_factor"]
+        nir   = data[1] / fe["s2_scale_factor"]
+        swir2 = data[2] / fe["s2_scale_factor"]
+        scl   = data[3]
         valid_scl = np.isin(scl.astype(np.int32), fe["scl_valid_values"])
 
         ndvi = spectral_index(nir, red)
@@ -348,24 +351,41 @@ def main():
         with rasterio.open(year_raster_path, "w", **meta_year) as dst:
             dst.write(year_map, 1)
 
-        # ── Polygon vectorisation ─────────────────────────────────────────
-        # Rasterio shapes() yields (geometry_dict, value) pairs
-        shapes = list(rio_features.shapes(binary, mask=binary, transform=transform))
+        # ── Polygon vectorisation + per-polygon year assignment ──────────────
+        shapes_list = [(gd, int(v))
+                       for gd, v in rio_features.shapes(binary, mask=binary,
+                                                         transform=transform)
+                       if int(v) > 0]
 
-        for geom_dict, val in shapes:
-            if int(val) == 0:
-                continue
-            geom = shapely.geometry.shape(geom_dict)
-            # Assign the most common predicted year within this polygon
-            # (approximate via bounding-box pixel sample)
-            pixel_years = year_map[binary == 1]
-            if len(pixel_years) > 0:
-                predicted_year = int(np.bincount(pixel_years[pixel_years > 0]).argmax()
-                                     if (pixel_years > 0).any()
-                                     else sub_cfg["fallback_year"])
-            else:
-                predicted_year = sub_cfg["fallback_year"]
+        if not shapes_list:
+            logger.warning(f"[{tile_id}] shapes() returned no polygons")
+            continue
 
+        # Burn a unique integer ID per polygon into a raster so we can do a
+        # single vectorised year-aggregation pass rather than one rasterize per polygon.
+        poly_id_raster = np.zeros((H, W), dtype=np.int32)
+        for pid, (gd, _) in enumerate(shapes_list, start=1):
+            rio_features.rasterize([(gd, pid)], out_shape=(H, W),
+                                   transform=transform, out=poly_id_raster,
+                                   merge_alg=rio_features.MergeAlg.replace)
+
+        # Vectorised mode-year per polygon via pandas groupby
+        flat_ids   = poly_id_raster[binary == 1].ravel()
+        flat_years = year_map[binary == 1].ravel()
+        valid_mask = flat_years > 0
+        if valid_mask.any():
+            yr_df      = pd.DataFrame({"pid": flat_ids[valid_mask],
+                                       "year": flat_years[valid_mask]})
+            mode_years = (yr_df.groupby("pid")["year"]
+                          .agg(lambda x: int(x.mode().iloc[0]))
+                          .to_dict())
+        else:
+            mode_years = {}
+
+        fallback = int(sub_cfg["fallback_year"])
+        for pid, (gd, _) in enumerate(shapes_list, start=1):
+            geom = shapely.geometry.shape(gd)
+            predicted_year = mode_years.get(pid, fallback)
             all_geojson_features.append({
                 "type": "Feature",
                 "geometry": shapely.geometry.mapping(geom),
@@ -375,9 +395,9 @@ def main():
                 },
             })
 
-        logger.info(f"[{tile_id}] Polygons: {len(shapes)} | "
-                    f"Binary raster: {pred_raster_path.name} | "
-                    f"Year raster: {year_raster_path.name}")
+        logger.info(f"[{tile_id}] Polygons: {len(shapes_list)} | "
+                    f"Binary: {pred_raster_path.name} | "
+                    f"Year: {year_raster_path.name}")
 
     # ── Write combined submission GeoJSON ─────────────────────────────────
     if not all_geojson_features:

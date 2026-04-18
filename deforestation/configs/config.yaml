@@ -102,7 +102,7 @@ paths_test:
 # ─── Submission ───────────────────────────────────────────────────────────────
 submission:
   output_dir: "data/submission"
-  probability_threshold: 0.35   # updated by phase_ensemble_threshold.py
+  probability_threshold: 0.55   # XGBoost-optimal from threshold sweep (IoU=0.3428)
   min_area_pixels: 5            # filter isolated single-pixel noise
   # Year prediction: find the S1 VV timestep with the largest single-step drop.
   # For post-2020 constraint: only consider months from 2020-01 onwards.
