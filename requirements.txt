@@ -9,6 +9,3 @@ botocore  # Version defined by boto3, but explicitly imported
 tqdm~=4.66
 ipykernel
 jupyter
-torch
-torchvision
-gradio
