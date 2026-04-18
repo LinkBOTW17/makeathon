@@ -2,17 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class UTAEPlaceholder(nn.Module):
+class StatisticalTemporalEncoder(nn.Module):
     """
-    Placeholder for U-TAE (U-Net with Temporal Attention Encoder).
-    For the hackathon, we can use a simpler 3D CNN or a Time-averaged 2D U-Net
-    if full U-TAE is too complex to implement quickly.
+    Upgraded Temporal Encoder replacing the naive UTAEPlaceholder.
+    By concatenating the Min, Max, and Mean across time, the model can 
+    natively measure variance and spot distinct chronological anomalies 
+    (like a pristine forest turning suddenly barren in month 7).
     """
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        # Simplified: just average over time and run through a 2D Conv
+        # Input to conv is now 3x the channels because we concatenate Min, Max, Mean!
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels * 3, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, out_channels, kernel_size=3, padding=1),
@@ -22,10 +23,13 @@ class UTAEPlaceholder(nn.Module):
 
     def forward(self, x):
         # x shape: (B, T, C, H, W)
-        # Average over temporal dimension (T) to handle clouds implicitly via mean.
-        # Note: A real U-TAE uses L-TAE (Lightweight Temporal Attention) here.
-        x_mean = x.mean(dim=1)  # Shape: (B, C, H, W)
-        return self.conv(x_mean)
+        x_min = x.min(dim=1)[0]
+        x_max = x.max(dim=1)[0]
+        x_mean = x.mean(dim=1)
+        
+        # Concat across temporal statistics -> (B, C*3, H, W)
+        x_stat = torch.cat([x_min, x_max, x_mean], dim=1)
+        return self.conv(x_stat)
 
 class FusionNet(nn.Module):
     def __init__(self, s1_channels=2, s2_channels=10, aef_channels=768, num_classes=1):
@@ -39,8 +43,8 @@ class FusionNet(nn.Module):
         )
         self.s1_proj = nn.Conv2d(16, 64, kernel_size=1)
         
-        # S2 branch (Optical - e.g. 10 bands like B2, B3, B4, B8, etc)
-        self.s2_encoder = UTAEPlaceholder(s2_channels, 64)
+        # S2 branch (Optical - e.g. 12 bands like B2, B3, B4, B8, etc)
+        self.s2_encoder = StatisticalTemporalEncoder(s2_channels, 64)
         
         # AEF Foundation Model Embeddings branch
         self.aef_proj = nn.Sequential(

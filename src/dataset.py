@@ -124,12 +124,32 @@ class OsapiensDataset(Dataset):
             new_tensor[..., :copy_h, :copy_w] = data_tensor[..., :copy_h, :copy_w]
             return new_tensor
 
+        s2_tensor = torch.tensor(s2_data, dtype=torch.float32)
+        s1_tensor = pad_to_ref(torch.tensor(s1_data, dtype=torch.float32), ref_h, ref_w) if s1_data is not None else torch.empty(0)
+        aef_tensor = pad_to_ref(torch.tensor(aef_data, dtype=torch.float32), ref_h, ref_w) if aef_data is not None else torch.empty(0)
+        label_final = pad_to_ref(label_tensor, ref_h, ref_w) if label_tensor is not None else torch.empty(0)
+        
+        # Phase 2: Synchronized Spatio-Temporal Data Augmentation
+        if self.split == "train":
+            # Horizontal Flip (50% chance)
+            if torch.rand(1).item() > 0.5:
+                s2_tensor = torch.flip(s2_tensor, dims=[-1])
+                if s1_tensor.nelement() > 0: s1_tensor = torch.flip(s1_tensor, dims=[-1])
+                if aef_tensor.nelement() > 0: aef_tensor = torch.flip(aef_tensor, dims=[-1])
+                if label_final.nelement() > 0: label_final = torch.flip(label_final, dims=[-1])
+            # Vertical Flip (50% chance)
+            if torch.rand(1).item() > 0.5:
+                s2_tensor = torch.flip(s2_tensor, dims=[-2])
+                if s1_tensor.nelement() > 0: s1_tensor = torch.flip(s1_tensor, dims=[-2])
+                if aef_tensor.nelement() > 0: aef_tensor = torch.flip(aef_tensor, dims=[-2])
+                if label_final.nelement() > 0: label_final = torch.flip(label_final, dims=[-2])
+
         sample = {
             "tile_id": tile_id,
-            "s2": torch.tensor(s2_data, dtype=torch.float32),
-            "s1": pad_to_ref(torch.tensor(s1_data, dtype=torch.float32), ref_h, ref_w) if s1_data is not None else torch.empty(0),
-            "aef": pad_to_ref(torch.tensor(aef_data, dtype=torch.float32), ref_h, ref_w) if aef_data is not None else torch.empty(0),
-            "label": pad_to_ref(label_tensor, ref_h, ref_w) if label_tensor is not None else torch.empty(0)
+            "s2": s2_tensor,
+            "s1": s1_tensor,
+            "aef": aef_tensor,
+            "label": label_final
         }
             
         return sample

@@ -9,9 +9,18 @@ from tqdm import tqdm
 from dataset import OsapiensDataset
 from models.fusion_net import FusionNet
 
-def confidence_weighted_bce_loss(logits, targets):
-    """BCE with logits — targets are already soft [0,1] consensus values."""
-    return F.binary_cross_entropy_with_logits(logits, targets)
+def dice_loss_fn(logits, targets, smooth=1.0):
+    probs = torch.sigmoid(logits).view(-1)
+    targets = targets.view(-1)
+    intersection = (probs * targets).sum()
+    dice_score = (2. * intersection + smooth) / (probs.sum() + targets.sum() + smooth)
+    return 1. - dice_score
+
+def combo_loss(logits, targets):
+    """Combines BCE for pixel stability with Dice Loss for strict IoU polygon optimization."""
+    bce = F.binary_cross_entropy_with_logits(logits, targets)
+    dice = dice_loss_fn(logits, targets)
+    return 0.5 * bce + 0.5 * dice
 
 def train_one_epoch(model, dataloader, optimizer, device):
     model.train()
@@ -39,7 +48,7 @@ def train_one_epoch(model, dataloader, optimizer, device):
         optimizer.zero_grad()
         
         logits = model(s1, s2, aef)       
-        loss = confidence_weighted_bce_loss(logits, target)
+        loss = combo_loss(logits, target)
             
         loss.backward()
         
