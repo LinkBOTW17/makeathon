@@ -663,28 +663,18 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
             transform = src.transform
             crs       = src.crs
 
-        polygons, years = [], []
+        polygons = []
         for geom_dict, val in shapes(binary, mask=binary, transform=transform):
             if val != 1:
                 continue
-            geom = shape(geom_dict)
-            # Year: mode of year_offset within polygon bounding box (fast approx)
-            cx, cy = geom.centroid.x, geom.centroid.y
-            col = int((cx - transform.c) / transform.a)
-            row = int((cy - transform.f) / transform.e)
-            H, W = binary.shape
-            col = max(0, min(col, W - 1))
-            row = max(0, min(row, H - 1))
-            yr  = int(yr_offset[row, col]) + 2020
-            # Format as YYMM — use mid-year (06) since AEF gives year precision only
-            time_step = f"{yr % 100:02d}06"
-            polygons.append(geom)
-            years.append(time_step)
+            polygons.append(shape(geom_dict))
 
         if not polygons:
             continue
 
-        gdf = gpd.GeoDataFrame({"time_step": years}, geometry=polygons, crs=crs)
+        # time_step = null (omitted) — avoids format rejection by scorer.
+        # Year accuracy will be added once spatial IoU is confirmed working.
+        gdf = gpd.GeoDataFrame(geometry=polygons, crs=crs)
         gdf = gdf.to_crs("EPSG:4326")
 
         # Area filter ≥ 0.5 ha
@@ -708,9 +698,6 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
     if verbose:
         print(f"\n  Submission GeoJSON → {out_path}")
         print(f"  Total deforestation polygons : {len(submission)}")
-        yr_counts = submission["time_step"].value_counts().sort_index()
-        for ts, cnt in yr_counts.items():
-            print(f"    {ts} (20{ts[:2]}-{ts[2:]}): {cnt} polygon(s)")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
