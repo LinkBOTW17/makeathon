@@ -107,10 +107,13 @@ xgboost:
 # ─── Temporal model (Phase 3b) ────────────────────────────────────────────────
 model:
   aef_dim: 64
+  n_ts_features: 3        # NDVI, NBR, VV_dB
   lstm_hidden: 64
+  lstm_layers: 2
+  lstm_dropout: 0.2
   mlp_layers: [128, 64, 32]
   learning_rate: 0.001
   max_epochs: 100
   patience: 10
   lr_scheduler_patience: 5
-  batch_size: 256
+  batch_size: 1024         # larger batches for LSTM efficiency on GPU

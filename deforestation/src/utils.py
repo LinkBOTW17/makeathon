@@ -345,6 +345,132 @@ def normalize_aef(data: np.ndarray) -> np.ndarray:
     return out
 
 
+# ─── PyTorch model & dataset (Phase 3b+) ────────────────────────────────────
+
+def get_device() -> "torch.device":
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return device
+
+
+class DeforestationDataset:
+    """
+    PyTorch Dataset for pixel-level deforestation detection.
+
+    Stores time series and AEF arrays entirely in RAM for fast batch access.
+    NaN values (cloud/no-data) are replaced with 0 at fetch time.
+    """
+
+    def __init__(self,
+                 indices: np.ndarray,
+                 s2_ts:   np.ndarray,   # (N_total, T, 2)  NDVI+NBR
+                 s1_ts:   np.ndarray,   # (N_total, T, 1)  VV_dB
+                 aef:     np.ndarray,   # (N_total, 64)
+                 labels:  np.ndarray,   # (N_total,)
+                 ts_mean: np.ndarray | None = None,  # (3,) global mean per channel
+                 ts_std:  np.ndarray | None = None,  # (3,) global std per channel
+                 aef_mean: np.ndarray | None = None,
+                 aef_std:  np.ndarray | None = None):
+        self.indices  = indices
+        self.s2_ts    = s2_ts
+        self.s1_ts    = s1_ts
+        self.aef      = aef
+        self.labels   = labels
+        self.ts_mean  = ts_mean if ts_mean is not None else np.zeros(3, dtype=np.float32)
+        self.ts_std   = ts_std  if ts_std  is not None else np.ones(3, dtype=np.float32)
+        self.aef_mean = aef_mean if aef_mean is not None else np.zeros(64, dtype=np.float32)
+        self.aef_std  = aef_std  if aef_std  is not None else np.ones(64, dtype=np.float32)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        import torch
+
+        i  = self.indices[idx]
+        s2 = self.s2_ts[i]           # (T, 2)
+        s1 = self.s1_ts[i]           # (T, 1)
+        ts = np.concatenate([s2, s1], axis=1).astype(np.float32)  # (T, 3)
+
+        # Replace NaN (cloud / no-data) with 0 before normalisation
+        ts = np.nan_to_num(ts, nan=0.0)
+
+        # Z-normalise per channel using training statistics
+        ts = (ts - self.ts_mean[None, :]) / (self.ts_std[None, :] + 1e-8)
+
+        aef = self.aef[i].astype(np.float32)
+        aef = (aef - self.aef_mean) / (self.aef_std + 1e-8)
+
+        return (
+            torch.tensor(ts,                       dtype=torch.float32),
+            torch.tensor(aef,                      dtype=torch.float32),
+            torch.tensor([self.labels[i]],         dtype=torch.float32),
+        )
+
+
+class DeforestationModel:
+    """
+    Wrapper to make the nn.Module importable without top-level torch import.
+    Actual nn.Module is returned by DeforestationModel.build().
+    """
+
+    @staticmethod
+    def build(n_ts_features: int = 3,
+              aef_dim:       int = 64,
+              lstm_hidden:   int = 64,
+              lstm_layers:   int = 2,
+              lstm_dropout:  float = 0.2,
+              mlp_layers:    list  = None):
+        import torch.nn as nn
+
+        if mlp_layers is None:
+            mlp_layers = [128, 64, 32]
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+
+                # Branch A: temporal encoder
+                # VV slope is dominant signal (Phase 3a showed #1 gain) —
+                # LSTM over full 72-step trajectory captures this far better
+                # than a single summary statistic.
+                self.lstm = nn.LSTM(
+                    input_size  = n_ts_features,
+                    hidden_size = lstm_hidden,
+                    num_layers  = lstm_layers,
+                    batch_first = True,
+                    dropout     = lstm_dropout if lstm_layers > 1 else 0.0,
+                )
+
+                # Branch B: AEF semantic projection
+                self.aef_proj = nn.Sequential(
+                    nn.Linear(aef_dim, 64),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                )
+
+                # Fusion head
+                in_dim = lstm_hidden + 64
+                layers = []
+                for out_dim in mlp_layers:
+                    layers += [nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(0.2)]
+                    in_dim = out_dim
+                layers.append(nn.Linear(in_dim, 1))
+                self.head = nn.Sequential(*layers)
+
+            def forward(self, ts, aef):
+                # ts:  (B, T, n_ts_features)
+                # aef: (B, aef_dim)
+                _, (h_n, _) = self.lstm(ts)
+                temporal_emb = h_n[-1]        # (B, lstm_hidden)
+                aef_emb      = self.aef_proj(aef)   # (B, 64)
+                fused        = torch.cat([temporal_emb, aef_emb], dim=1)
+                return self.head(fused)        # (B, 1) logits
+
+        import torch  # noqa: F401 — ensures torch is importable before returning
+        return _Model()
+
+
 # ─── Metrics ──────────────────────────────────────────────────────────────────
 
 def compute_binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
