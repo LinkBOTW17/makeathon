@@ -1,8 +1,8 @@
 """
-Pixel-Level LightGBM v3 — Full Multimodal Deforestation Classifier
+Pixel-Level LightGBM v4 — Full Multimodal Deforestation Classifier
 ===================================================================
 
-Features per pixel (151 total):
+Features per pixel (154 total):
   AEF change signals  (78):
     aef_l2_delta_{2021-2024}       — L2 between consecutive year embeddings
     aef_cos_delta_{2021-2024}      — cosine distance between consecutive years
@@ -19,15 +19,21 @@ Features per pixel (151 total):
     sar_pre, sar_post              — mean SAR dB in 2020-21 vs 2022-24
     sar_change                     — pre − post in dB
 
-  Harmonic physics  (2):  ← NEW — was top-2 feature at polygon level
+  Harmonic physics  (2):
     harmonic_t_stat                — vectorised per-pixel NDVI breakpoint t-stat
     harmonic_change_mag            — mean absolute post-cutoff NDVI residual
 
   AEF baseline  (64):
     aef_2020_{0-63}                — 2020 embedding (forest type baseline)
 
+  Spatial neighborhood  (3):  ← NEW
+    nbr5_aef_max_delta_l2          — 5×5 mean of peak AEF L2 change (context)
+    nbr5_ndvi_change               — 5×5 mean of NDVI drop (context)
+    nbr5_harmonic_tstat            — 5×5 mean of harmonic breakpoint t-stat
+
 Post-processing:
-  Gaussian smoothing (σ=1.5) — kills isolated-pixel false positives.
+  Gaussian smoothing (σ=1.5) + morphological closing (2 iters) — kills
+  isolated-pixel false positives and fills interior holes in deforested patches.
 
 Threshold: dual-target per region from LOTO-CV.
   IoU-optimal threshold OR min-recall threshold (whichever is lower),
@@ -54,7 +60,7 @@ import rasterio
 from lightgbm import LGBMClassifier
 from rasterio.features import shapes
 from rasterio.warp import reproject, Resampling
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import binary_closing, gaussian_filter, uniform_filter
 from shapely.geometry import shape
 from sklearn.preprocessing import RobustScaler
 
@@ -69,7 +75,7 @@ from validate_spatial import build_gt_pixel_map               # noqa: E402
 
 AEF_YEARS         = [2020, 2021, 2022, 2023, 2024]
 DELTA_YEARS       = [2021, 2022, 2023, 2024]
-N_FEATURES        = 151
+N_FEATURES        = 154
 N_SAMPLE_PER_TILE = 80_000   # increased; positives uncapped
 GAUSS_SIGMA       = 1.5
 RECALL_TARGET     = 0.65     # minimum recall to enforce at threshold selection
@@ -101,8 +107,9 @@ FEATURE_NAMES = (
     ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +  # 4
     ["sar_pre", "sar_post", "sar_change"] +              # 3
     ["harmonic_t_stat", "harmonic_change_mag"] +         # 2
-    [f"aef_2020_{i:02d}"      for i in range(64)]        # 64 — forest-type baseline
-)   # total = 151
+    [f"aef_2020_{i:02d}"      for i in range(64)] +      # 64 — forest-type baseline
+    ["nbr5_aef_max_delta_l2", "nbr5_ndvi_change", "nbr5_harmonic_tstat"]  # 3 spatial context
+)   # total = 154
 assert len(FEATURE_NAMES) == N_FEATURES
 
 
@@ -388,10 +395,12 @@ def compute_pixel_features(
     rows: np.ndarray | None = None,
     cols: np.ndarray | None = None,
     harmonic_maps: tuple[np.ndarray, np.ndarray] | None = None,
+    nbr_maps: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     """
-    Build (N, 149) feature matrix.
+    Build (N, N_FEATURES) feature matrix.
     If rows/cols given, extracts only sampled pixels; otherwise flattens all.
+    nbr_maps: pre-computed 5×5 neighborhood-averaged 2D maps.
     """
     any_emb  = next(iter(aef_by_year.values()))
     _, H, W  = any_emb.shape
@@ -467,8 +476,50 @@ def compute_pixel_features(
         feats[:, c:c + 64] = emb[2020].T
     c += 64
 
+    # ── Spatial neighborhood features (5×5 mean of key change signals) ───────
+    for key in ("nbr5_aef_max_delta_l2", "nbr5_ndvi_change", "nbr5_harmonic_tstat"):
+        if nbr_maps and key in nbr_maps:
+            feats[:, c] = _px(nbr_maps[key])
+        c += 1
+
     assert c == N_FEATURES, f"Feature count mismatch: {c} != {N_FEATURES}"
     return feats
+
+
+# ── spatial neighborhood maps ─────────────────────────────────────────────────
+
+def compute_nbr_maps(
+    aef_by_year: dict[int, np.ndarray],
+    ndvi_sar: dict[str, np.ndarray] | None,
+    harmonic_maps: tuple[np.ndarray, np.ndarray] | None,
+    size: int = 5,
+) -> dict[str, np.ndarray]:
+    """
+    Compute 5×5 neighborhood-mean maps for three key change signals.
+    Returns {key: (H, W) float32} suitable for passing to compute_pixel_features.
+    """
+    nbr: dict[str, np.ndarray] = {}
+
+    # AEF max L2 delta across all years
+    l2_layers = []
+    for yr in DELTA_YEARS:
+        if yr in aef_by_year and (yr - 1) in aef_by_year:
+            l2_layers.append(np.linalg.norm(aef_by_year[yr] - aef_by_year[yr - 1], axis=0))
+    if l2_layers:
+        aef_max_map = np.stack(l2_layers, axis=0).max(axis=0).astype(np.float32)
+        nbr["nbr5_aef_max_delta_l2"] = uniform_filter(aef_max_map, size=size)
+
+    if ndvi_sar and "ndvi_change" in ndvi_sar:
+        nbr["nbr5_ndvi_change"] = uniform_filter(
+            ndvi_sar["ndvi_change"].astype(np.float32), size=size
+        )
+
+    if harmonic_maps is not None:
+        nbr["nbr5_harmonic_tstat"] = uniform_filter(
+            harmonic_maps[0].astype(np.float32), size=size
+        )
+
+    return nbr
 
 
 # ── tile pixel sampling ───────────────────────────────────────────────────────
@@ -542,7 +593,8 @@ def sample_tile(
     if ts_src is not None and mo_src is not None and len(mo_src) > 0:
         harmonic_maps = compute_harmonic_maps(ts_src, mo_src)
 
-    feats  = compute_pixel_features(aef_by_year, ndvi_sar, rows, cols_arr, harmonic_maps)
+    nbr_maps = compute_nbr_maps(aef_by_year, ndvi_sar, harmonic_maps)
+    feats  = compute_pixel_features(aef_by_year, ndvi_sar, rows, cols_arr, harmonic_maps, nbr_maps)
     labels = flat_gt[idx].astype(np.int32)
     yrs    = flat_year[idx].astype(np.int32)
     return feats, labels, yrs
@@ -758,7 +810,8 @@ def predict_tile(
     if ndvi_ts is not None and ndvi_months is not None and len(ndvi_months) > 0:
         harmonic_maps = compute_harmonic_maps(ndvi_ts, ndvi_months)
 
-    feats = compute_pixel_features(aef_by_year, ndvi_sar, harmonic_maps=harmonic_maps)   # (H*W, N_FEATURES)
+    nbr_maps = compute_nbr_maps(aef_by_year, ndvi_sar, harmonic_maps)
+    feats = compute_pixel_features(aef_by_year, ndvi_sar, harmonic_maps=harmonic_maps, nbr_maps=nbr_maps)   # (H*W, N_FEATURES)
 
     if nan_fill is not None:
         feats = np.where(np.isfinite(feats), feats, nan_fill)
@@ -773,8 +826,10 @@ def predict_tile(
         proba[s:e] = model.predict_proba(scaler.transform(feats[s:e]))[:, 1]
 
     # Gaussian spatial smoothing — kills isolated-pixel FP
-    prob_map    = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
-    binary_map  = (prob_map >= thresh).astype(np.uint8)
+    prob_map   = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
+    binary_map = (prob_map >= thresh).astype(np.uint8)
+    # Morphological closing — fills small interior holes within deforested patches
+    binary_map = binary_closing(binary_map, iterations=2).astype(np.uint8)
 
     # Year: prefer NDVI change year (interpretable), fallback to AEF argmax
     if ndvi_sar and "ndvi_change_year_idx" in ndvi_sar:
@@ -861,7 +916,7 @@ def _build_submission(raster_paths: list[Path], out_dir: Path, verbose: bool) ->
         gdf = gpd.GeoDataFrame({"time_step": timesteps}, geometry=polygons, crs=crs)
         gdf = gdf.to_crs("EPSG:4326")
         utm = gdf.estimate_utm_crs()
-        gdf = gdf[(gdf.to_crs(utm).area / 10_000) >= 0.5].reset_index(drop=True)
+        gdf = gdf[(gdf.to_crs(utm).area / 10_000) >= 0.1].reset_index(drop=True)
         if not gdf.empty:
             pieces.append(gdf)
 
