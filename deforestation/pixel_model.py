@@ -1,8 +1,8 @@
 """
-Pixel-Level LightGBM v2 — Full Multimodal Deforestation Classifier
+Pixel-Level LightGBM v3 — Full Multimodal Deforestation Classifier
 ===================================================================
 
-Features per pixel (149 total):
+Features per pixel (151 total):
   AEF change signals  (78):
     aef_l2_delta_{2021-2024}       — L2 between consecutive year embeddings
     aef_cos_delta_{2021-2024}      — cosine distance between consecutive years
@@ -19,14 +19,19 @@ Features per pixel (149 total):
     sar_pre, sar_post              — mean SAR dB in 2020-21 vs 2022-24
     sar_change                     — pre − post in dB
 
+  Harmonic physics  (2):  ← NEW — was top-2 feature at polygon level
+    harmonic_t_stat                — vectorised per-pixel NDVI breakpoint t-stat
+    harmonic_change_mag            — mean absolute post-cutoff NDVI residual
+
   AEF baseline  (64):
     aef_2020_{0-63}                — 2020 embedding (forest type baseline)
 
 Post-processing:
-  Gaussian smoothing (σ=1.5) on probability map before threshold.
-  → kills isolated-pixel false positives, reduces FPR significantly.
+  Gaussian smoothing (σ=1.5) — kills isolated-pixel false positives.
 
-Threshold: IoU-optimal per region from LOTO-CV.
+Threshold: dual-target per region from LOTO-CV.
+  IoU-optimal threshold OR min-recall threshold (whichever is lower),
+  biased toward Recall to close the 53% → 70%+ gap.
 
 Usage (from makeathon root):
     python deforestation/pixel_model.py --mode all
@@ -62,11 +67,12 @@ from validate_spatial import build_gt_pixel_map               # noqa: E402
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-AEF_YEARS        = [2020, 2021, 2022, 2023, 2024]
-DELTA_YEARS      = [2021, 2022, 2023, 2024]
-N_FEATURES       = 149
-N_SAMPLE_PER_TILE = 60_000
-GAUSS_SIGMA      = 1.5    # spatial smoothing to kill isolated-pixel FP
+AEF_YEARS         = [2020, 2021, 2022, 2023, 2024]
+DELTA_YEARS       = [2021, 2022, 2023, 2024]
+N_FEATURES        = 151
+N_SAMPLE_PER_TILE = 80_000   # increased; positives uncapped
+GAUSS_SIGMA       = 1.5
+RECALL_TARGET     = 0.65     # minimum recall to enforce at threshold selection
 
 REGIONS = {"SEA": ("47", "48"), "SAM": ("18", "19")}
 
@@ -94,6 +100,7 @@ FEATURE_NAMES = (
     [f"aef_delta_vec_{i:02d}" for i in range(64)] +
     ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +
     ["sar_pre", "sar_post", "sar_change"] +
+    ["harmonic_t_stat", "harmonic_change_mag"] +
     [f"aef_2020_{i:02d}"      for i in range(64)]
 )
 assert len(FEATURE_NAMES) == N_FEATURES
@@ -173,11 +180,12 @@ def load_ndvi_sar_maps(
     ref_transform,
     ref_crs,
     ref_shape: tuple,
-) -> dict[str, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], np.ndarray | None, np.ndarray | None]:
     """
-    Returns pixel maps: ndvi_pre, ndvi_post, ndvi_change, ndvi_std,
-                        sar_pre,  sar_post,  sar_change
-    Each is (H, W) float32.  NaN where data is missing.
+    Returns (maps, ndvi_ts, ndvi_months) where:
+      maps       — pixel maps: ndvi_pre/post/change/std, sar_pre/post/change (H,W each)
+      ndvi_ts    — raw NDVI time series (T, H, W) float32, or None
+      ndvi_months— integer month indices (T,), or None
     """
     H, W = ref_shape
     out: dict[str, np.ndarray] = {}
@@ -207,9 +215,13 @@ def load_ndvi_sar_maps(
         ndvi_stack.append(nd)
         ndvi_months.append(_month_index(yr, mo))
 
+    ndvi_ts_arr    = None
+    ndvi_months_arr = None
     if ndvi_stack:
         ndvi_arr = np.stack(ndvi_stack, axis=0)            # (T, H, W)
-        months   = np.array(ndvi_months)
+        ndvi_ts_arr     = ndvi_arr
+        ndvi_months_arr = np.array(ndvi_months, dtype=np.int32)
+        months   = ndvi_months_arr
         pre_sel  = months < 24
         post_sel = months >= 24
 
@@ -260,7 +272,74 @@ def load_ndvi_sar_maps(
         out["sar_post"]   = sar_post.astype(np.float32)
         out["sar_change"] = (sar_pre - sar_post).astype(np.float32)
 
-    return out
+    return out, ndvi_ts_arr, ndvi_months_arr
+
+
+# ── vectorised harmonic NDVI breakpoint ──────────────────────────────────────
+
+def compute_harmonic_maps(
+    ndvi_ts: np.ndarray,        # (T, H, W) float32
+    ndvi_months: np.ndarray,    # (T,) int
+    train_cutoff: int = 24,
+    n_harmonics: int = 2,
+    min_train_obs: int = 8,
+    min_test_obs:  int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorised harmonic regression across all pixels simultaneously.
+    Returns (t_stat_map, change_mag_map), each (H, W) float32.
+
+    t_stat > 0 means NDVI dropped below the harmonic baseline (deforestation signal).
+    """
+    T, H, W = ndvi_ts.shape
+    N = H * W
+    K = 2 + 2 * n_harmonics    # intercept + trend + harmonics
+
+    t = ndvi_months.astype(np.float32)
+    cols = [np.ones(T, dtype=np.float32), t]
+    for k in range(1, n_harmonics + 1):
+        cols += [np.cos(2 * np.pi * k * t / 12), np.sin(2 * np.pi * k * t / 12)]
+    X = np.column_stack(cols).astype(np.float32)   # (T, K)
+
+    ndvi_flat  = ndvi_ts.reshape(T, N).astype(np.float32)
+    valid_mask = np.isfinite(ndvi_flat)             # (T, N)
+    ndvi_clean = np.where(valid_mask, ndvi_flat, 0.0)
+
+    tr_sel = ndvi_months < train_cutoff
+    te_sel = ndvi_months >= train_cutoff
+
+    X_tr = X[tr_sel];  X_te = X[te_sel]
+    y_tr = ndvi_clean[tr_sel];  y_te = ndvi_clean[te_sel]
+    vm_tr = valid_mask[tr_sel]; vm_te = valid_mask[te_sel]
+
+    n_tr = vm_tr.sum(axis=0).astype(np.float32)    # (N,)
+    n_te = vm_te.sum(axis=0).astype(np.float32)
+
+    # OLS: β = (X_tr^T X_tr)^{-1} X_tr^T y  — single shared XtX (approx for NaN)
+    XtX     = (X_tr.T @ X_tr).astype(np.float64)
+    XtX_inv = np.linalg.pinv(XtX + 1e-6 * np.eye(K)).astype(np.float32)
+    beta    = XtX_inv @ (X_tr.T @ y_tr)            # (K, N)
+
+    # Baseline residual std
+    resid_tr = np.where(vm_tr, y_tr - X_tr @ beta, np.nan)   # (T_tr, N)
+    std_tr   = np.nanstd(resid_tr, axis=0).clip(1e-6)         # (N,)
+
+    # Post-cutoff residuals: positive = NDVI fell below prediction
+    resid_te    = np.where(vm_te, (X_te @ beta) - y_te, np.nan)
+    mean_resid  = np.nanmean(resid_te, axis=0)
+    change_mag  = np.nanmean(np.abs(resid_te), axis=0)
+
+    t_stat = mean_resid / (std_tr / np.sqrt(n_te.clip(1)))
+
+    # Zero-out pixels with insufficient observations
+    bad = (n_tr < min_train_obs) | (n_te < min_test_obs)
+    t_stat[bad]    = 0.0
+    change_mag[bad] = 0.0
+
+    return (
+        t_stat.reshape(H, W).astype(np.float32),
+        change_mag.reshape(H, W).astype(np.float32),
+    )
 
 
 # ── pixel feature matrix ──────────────────────────────────────────────────────
@@ -270,6 +349,7 @@ def compute_pixel_features(
     ndvi_sar:    dict[str, np.ndarray] | None,
     rows: np.ndarray | None = None,
     cols: np.ndarray | None = None,
+    harmonic_maps: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """
     Build (N, 149) feature matrix.
@@ -338,6 +418,12 @@ def compute_pixel_features(
             feats[:, c] = _px(ndvi_sar[key])
         c += 1
 
+    # ── Harmonic t-stat + change magnitude ───────────────────────────────────
+    if harmonic_maps is not None:
+        feats[:, c]     = _px(harmonic_maps[0])   # t_stat
+        feats[:, c + 1] = _px(harmonic_maps[1])   # change_mag
+    c += 2
+
     # ── AEF 2020 baseline embedding (64-dim) ──────────────────────────────────
     if 2020 in emb:
         feats[:, c:c + 64] = emb[2020].T
@@ -383,14 +469,19 @@ def sample_tile(
         if verbose: print(f"  {tile_id}: no positive pixels — SKIP")
         return None
 
-    n_pos = min(len(pos_idx), n_sample // 2)
-    n_neg = min(len(neg_idx), n_sample - n_pos)
+    # Use ALL positives; match with 2× negatives (uncapped positive class)
+    n_pos = len(pos_idx)
+    n_neg = min(len(neg_idx), 2 * n_pos)
+    # Hard cap to keep memory sane
+    if n_pos > n_sample:
+        n_pos = n_sample
+        pos_idx = rng.choice(pos_idx, n_pos, replace=False)
 
-    idx  = np.concatenate([
-        rng.choice(pos_idx, n_pos, replace=False),
+    idx = np.concatenate([
+        pos_idx,
         rng.choice(neg_idx, n_neg, replace=False),
     ])
-    rows = (idx // W).astype(np.int32)
+    rows     = (idx // W).astype(np.int32)
     cols_arr = (idx %  W).astype(np.int32)
 
     # AEF
@@ -401,12 +492,19 @@ def sample_tile(
         if verbose: print(f"  {tile_id}: missing 2020 AEF — SKIP")
         return None
 
-    # NDVI + SAR pixel maps
-    ndvi_sar = load_ndvi_sar_maps(
+    # NDVI + SAR pixel maps (also returns raw time series for harmonic maps)
+    ndvi_sar, ndvi_ts, ndvi_months = load_ndvi_sar_maps(
         tile_id, "train", td.ref_transform, td.ref_crs, td.ref_shape
     )
 
-    feats  = compute_pixel_features(aef_by_year, ndvi_sar, rows, cols_arr)
+    # Harmonic t-stat maps (vectorised)
+    harmonic_maps = None
+    ts_src  = ndvi_ts     if ndvi_ts     is not None else td.ndvi_ts
+    mo_src  = ndvi_months if ndvi_months is not None else (td.ndvi_months if hasattr(td, "ndvi_months") else None)
+    if ts_src is not None and mo_src is not None and len(mo_src) > 0:
+        harmonic_maps = compute_harmonic_maps(ts_src, mo_src)
+
+    feats  = compute_pixel_features(aef_by_year, ndvi_sar, rows, cols_arr, harmonic_maps)
     labels = flat_gt[idx].astype(np.int32)
     yrs    = flat_year[idx].astype(np.int32)
     return feats, labels, yrs
@@ -484,25 +582,32 @@ def train(mislabels_csv: Path, out_dir: Path, verbose: bool = True) -> dict:
             clf.fit(sc.fit_transform(X_tr), y_tr)
             p_va = clf.predict_proba(sc.transform(X_va))[:, 1]
 
-            # IoU-optimal threshold
+            # Dual-target threshold: IoU-optimal OR recall-floor, whichever is lower
             best_iou, best_t = 0.0, 0.5
+            recall_t = 0.15   # most aggressive fallback
             for t in np.arange(0.15, 0.85, 0.01):
-                iou = compute_iou(y_va, (p_va >= t).astype(int))
+                pred_t = (p_va >= t).astype(int)
+                iou = compute_iou(y_va, pred_t)
+                rec = compute_recall(y_va, pred_t)
                 if iou > best_iou:
-                    best_iou, best_t = iou, t
+                    best_iou, best_t = iou, float(t)
+                if rec >= RECALL_TARGET:
+                    recall_t = float(t)   # keep updating → highest t with recall≥target
 
-            pred = (p_va >= best_t).astype(int)
+            final_t = min(best_t, recall_t)   # lower = more recall
+            pred = (p_va >= final_t).astype(int)
             oof_preds[held] = {
                 "iou": compute_iou(y_va, pred),
                 "recall": compute_recall(y_va, pred),
                 "fpr": compute_fpr(y_va, pred),
-                "thresh": best_t,
+                "thresh": final_t,
             }
             loto_rows.append({"tile": held, "region": region, **oof_preds[held]})
             if verbose:
                 r = oof_preds[held]
                 print(f"    {held}: IoU={r['iou']:.3f}  Recall={r['recall']:.3f}  "
-                      f"FPR={r['fpr']:.3f}  thresh={r['thresh']:.2f}")
+                      f"FPR={r['fpr']:.3f}  thresh={r['thresh']:.2f}"
+                      f"  (iou_t={best_t:.2f} recall_t={recall_t:.2f})")
 
         # Median threshold for region
         region_thresh = float(np.median([v["thresh"] for v in oof_preds.values()])) \
@@ -609,9 +714,13 @@ def predict_tile(
         if verbose: print(f"  {tile_id}: missing AEF — SKIP")
         return None
 
-    ndvi_sar = load_ndvi_sar_maps(tile_id, split, ref_transform, ref_crs, ref_shape)
+    ndvi_sar, ndvi_ts, ndvi_months = load_ndvi_sar_maps(tile_id, split, ref_transform, ref_crs, ref_shape)
 
-    feats = compute_pixel_features(aef_by_year, ndvi_sar)   # (H*W, N_FEATURES)
+    harmonic_maps = None
+    if ndvi_ts is not None and ndvi_months is not None and len(ndvi_months) > 0:
+        harmonic_maps = compute_harmonic_maps(ndvi_ts, ndvi_months)
+
+    feats = compute_pixel_features(aef_by_year, ndvi_sar, harmonic_maps=harmonic_maps)   # (H*W, N_FEATURES)
 
     if nan_fill is not None:
         feats = np.where(np.isfinite(feats), feats, nan_fill)
