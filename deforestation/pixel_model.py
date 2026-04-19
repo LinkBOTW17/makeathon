@@ -69,7 +69,7 @@ from validate_spatial import build_gt_pixel_map               # noqa: E402
 
 AEF_YEARS         = [2020, 2021, 2022, 2023, 2024]
 DELTA_YEARS       = [2021, 2022, 2023, 2024]
-N_FEATURES        = 87
+N_FEATURES        = 151
 N_SAMPLE_PER_TILE = 80_000   # increased; positives uncapped
 GAUSS_SIGMA       = 1.5
 RECALL_TARGET     = 0.65     # minimum recall to enforce at threshold selection
@@ -93,15 +93,16 @@ LGBM_PARAMS = dict(
 )
 
 FEATURE_NAMES = (
-    [f"aef_l2_delta_{yr}"     for yr in DELTA_YEARS] +   # 4 — year-over-year L2
-    [f"aef_cos_delta_{yr}"    for yr in DELTA_YEARS] +   # 4 — cosine distance
-    [f"aef_from2020_l2_{yr}"  for yr in DELTA_YEARS] +  # 4 — cumulative drift from 2020
-    ["aef_max_delta_l2", "aef_change_year_idx"] +        # 2 — peak change summary
-    [f"aef_delta_vec_{i:02d}" for i in range(64)] +      # 64 — 64-dim change vector
-    ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +  # 4 — relative NDVI signals
-    ["sar_pre", "sar_post", "sar_change"] +              # 3 — SAR change
-    ["harmonic_t_stat", "harmonic_change_mag"]           # 2 — physics-based breakpoint
-)   # total = 87; all CHANGE/RELATIVE signals — no absolute baseline values
+    [f"aef_l2_delta_{yr}"     for yr in DELTA_YEARS] +   # 4
+    [f"aef_cos_delta_{yr}"    for yr in DELTA_YEARS] +   # 4
+    [f"aef_from2020_l2_{yr}"  for yr in DELTA_YEARS] +  # 4
+    ["aef_max_delta_l2", "aef_change_year_idx"] +        # 2
+    [f"aef_delta_vec_{i:02d}" for i in range(64)] +      # 64
+    ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +  # 4
+    ["sar_pre", "sar_post", "sar_change"] +              # 3
+    ["harmonic_t_stat", "harmonic_change_mag"] +         # 2
+    [f"aef_2020_{i:02d}"      for i in range(64)]        # 64 — forest-type baseline
+)   # total = 151
 assert len(FEATURE_NAMES) == N_FEATURES
 
 
@@ -461,6 +462,11 @@ def compute_pixel_features(
         feats[:, c + 1] = _px(harmonic_maps[1])   # change_mag
     c += 2
 
+    # ── AEF 2020 baseline embedding (64-dim) ─────────────────────────────────
+    if 2020 in emb:
+        feats[:, c:c + 64] = emb[2020].T
+    c += 64
+
     assert c == N_FEATURES, f"Feature count mismatch: {c} != {N_FEATURES}"
     return feats
 
@@ -769,6 +775,13 @@ def predict_tile(
     # Gaussian spatial smoothing — kills isolated-pixel FP
     prob_map    = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
     binary_map  = (prob_map >= thresh).astype(np.uint8)
+
+    # SAR confirmation filter — remove optical-only FP (cloud shadows, agri cycles)
+    # Real forest clearing: SAR backscatter decreases (forest → bare ground)
+    # sar_change = sar_pre − sar_post; positive ≡ SAR decreased ≡ real structural loss
+    if ndvi_sar and "sar_change" in ndvi_sar:
+        sar_confirmed = (ndvi_sar["sar_change"] > 1.0).astype(np.uint8)
+        binary_map    = binary_map & sar_confirmed
 
     # Year: prefer NDVI change year (interpretable), fallback to AEF argmax
     if ndvi_sar and "ndvi_change_year_idx" in ndvi_sar:
