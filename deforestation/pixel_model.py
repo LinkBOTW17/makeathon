@@ -571,6 +571,17 @@ def sample_tile(
         if verbose: print(f"  {tile_id}: no positive pixels — SKIP")
         return None
 
+    # Skip tiles where polygon GT labeled >80% of pixels as positive.
+    # Such tiles (e.g. 48PUT_0_8 with 96% positives) distort the model:
+    # the classifier learns "almost everything is deforested" and outputs
+    # inflated probabilities that spike LOTO thresholds to 0.8+.
+    n_total = len(pos_idx) + len(neg_idx)
+    pos_rate = len(pos_idx) / n_total
+    if pos_rate > 0.80:
+        if verbose:
+            print(f"  {tile_id}: pos_rate={pos_rate:.0%} — SKIP (extreme tile)")
+        return None
+
     # Use ALL positives; match with 2× negatives (uncapped positive class)
     n_pos = len(pos_idx)
     n_neg = min(len(neg_idx), 2 * n_pos)
@@ -742,9 +753,11 @@ def train(mislabels_csv: Path, out_dir: Path, verbose: bool = True) -> dict:
                 print(f"    {held}: IoU={r['iou']:.3f}  Recall={r['recall']:.3f}  "
                       f"FPR={r['fpr']:.3f}  thresh={r['thresh']:.2f}")
 
-        # Median threshold for region
-        region_thresh = float(np.median([v["thresh"] for v in oof_preds.values()])) \
-            if oof_preds else 0.5
+        # Median threshold for region — cap individual tiles at 0.60 to prevent
+        # outlier tiles (e.g. high-deforestation tiles that push thresholds to
+        # 0.80+) from inflating the region threshold and killing recall on test tiles.
+        region_thresh = float(np.median([min(v["thresh"], 0.60) for v in oof_preds.values()])) \
+            if oof_preds else 0.4
 
         # Final model on all region data
         X_all = np.vstack([tile_feats[t]  for t in rtiles])
