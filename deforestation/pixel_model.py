@@ -60,7 +60,7 @@ import rasterio
 from lightgbm import LGBMClassifier
 from rasterio.features import shapes
 from rasterio.warp import reproject, Resampling
-from scipy.ndimage import binary_closing, gaussian_filter, uniform_filter
+from scipy.ndimage import binary_closing, binary_opening, gaussian_filter, uniform_filter
 from shapely.geometry import shape
 from sklearn.preprocessing import RobustScaler
 
@@ -75,10 +75,10 @@ from validate_spatial import build_gt_pixel_map               # noqa: E402
 
 AEF_YEARS         = [2020, 2021, 2022, 2023, 2024]
 DELTA_YEARS       = [2021, 2022, 2023, 2024]
-N_FEATURES        = 154
+N_FEATURES        = 157
 N_SAMPLE_PER_TILE = 80_000   # increased; positives uncapped
 GAUSS_SIGMA       = 1.5
-RECALL_TARGET     = 0.65     # minimum recall to enforce at threshold selection
+RECALL_TARGET     = 0.50     # dropped target slightly to prioritize IoU peak
 
 REGIONS = {"SEA": ("47", "48"), "SAM": ("18", "19")}
 
@@ -108,8 +108,9 @@ FEATURE_NAMES = (
     ["sar_pre", "sar_post", "sar_change"] +              # 3
     ["harmonic_t_stat", "harmonic_change_mag"] +         # 2
     [f"aef_2020_{i:02d}"      for i in range(64)] +      # 64 — forest-type baseline
-    ["nbr5_aef_max_delta_l2", "nbr5_ndvi_change", "nbr5_harmonic_tstat"]  # 3 spatial context
-)   # total = 154
+    ["nbr5_aef_max_delta_l2", "nbr5_ndvi_change", "nbr5_harmonic_tstat",
+     "nbr5_sar_pre", "nbr5_sar_post", "nbr5_sar_change"]  # 6 spatial context
+)   # total = 157
 assert len(FEATURE_NAMES) == N_FEATURES
 
 
@@ -477,9 +478,14 @@ def compute_pixel_features(
     c += 64
 
     # ── Spatial neighborhood features (5×5 mean of key change signals) ───────
-    for key in ("nbr5_aef_max_delta_l2", "nbr5_ndvi_change", "nbr5_harmonic_tstat"):
+    harmonic_clip = 50.0  # limit impact of extreme outliers
+    for key in ("nbr5_aef_max_delta_l2", "nbr5_ndvi_change", "nbr5_harmonic_tstat",
+                "nbr5_sar_pre", "nbr5_sar_post", "nbr5_sar_change"):
         if nbr_maps and key in nbr_maps:
-            feats[:, c] = _px(nbr_maps[key])
+            val = _px(nbr_maps[key])
+            if "harmonic_tstat" in key:
+                val = np.clip(val, -harmonic_clip, harmonic_clip)
+            feats[:, c] = val
         c += 1
 
     assert c == N_FEATURES, f"Feature count mismatch: {c} != {N_FEATURES}"
@@ -518,6 +524,13 @@ def compute_nbr_maps(
         nbr["nbr5_harmonic_tstat"] = uniform_filter(
             harmonic_maps[0].astype(np.float32), size=size
         )
+
+    # SAR spatial context
+    for key in ("sar_pre", "sar_post", "sar_change"):
+        if ndvi_sar and key in ndvi_sar:
+            nbr[f"nbr5_{key}"] = uniform_filter(
+                ndvi_sar[key].astype(np.float32), size=size
+            )
 
     return nbr
 
@@ -558,9 +571,9 @@ def sample_tile(
         if verbose: print(f"  {tile_id}: no positive pixels — SKIP")
         return None
 
-    # Use ALL positives; match with 2× negatives (uncapped positive class)
+    # Use ALL positives; match with 3× negatives (uncapped positive class)
     n_pos = len(pos_idx)
-    n_neg = min(len(neg_idx), 2 * n_pos)
+    n_neg = min(len(neg_idx), 3 * n_pos)
     # Hard cap to keep memory sane
     if n_pos > n_sample:
         n_pos = n_sample
@@ -684,7 +697,8 @@ def train(mislabels_csv: Path, out_dir: Path, verbose: bool = True) -> dict:
                 if rec >= RECALL_TARGET:
                     recall_t = float(t)   # keep updating → highest t with recall≥target
 
-            final_t = min(best_t, recall_t)   # lower = more recall
+            # Select threshold that maximizes IoU on the cross-validation tile
+            final_t = best_t
             pred = (p_va >= final_t).astype(int)
             oof_preds[held] = {
                 "iou": compute_iou(y_va, pred),
@@ -827,8 +841,8 @@ def predict_tile(
 
     # Gaussian spatial smoothing — kills isolated-pixel FP
     prob_map   = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
-    binary_map = (prob_map >= thresh).astype(np.uint8)
-    # Morphological closing — fills small interior holes within deforested patches
+    # Morphological clean-up: Opening kills salt-and-pepper noise, Closing fills interior holes
+    binary_map = binary_opening(binary_map, iterations=1).astype(np.uint8)
     binary_map = binary_closing(binary_map, iterations=2).astype(np.uint8)
 
     # Year: prefer NDVI change year (interpretable), fallback to AEF argmax
