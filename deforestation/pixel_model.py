@@ -571,9 +571,9 @@ def sample_tile(
         if verbose: print(f"  {tile_id}: no positive pixels — SKIP")
         return None
 
-    # Use ALL positives; match with 3× negatives (uncapped positive class)
+    # Use ALL positives; match with 2× negatives (uncapped positive class)
     n_pos = len(pos_idx)
-    n_neg = min(len(neg_idx), 3 * n_pos)
+    n_neg = min(len(neg_idx), 2 * n_pos)
     # Hard cap to keep memory sane
     if n_pos > n_sample:
         n_pos = n_sample
@@ -652,6 +652,8 @@ def train(mislabels_csv: Path, out_dir: Path, verbose: bool = True) -> dict:
     sampled_tiles = list(tile_feats.keys())
     regions = {t: get_region(t) for t in sampled_tiles}
 
+    from mislabel_detection_v2 import load_tile
+
     models:  dict[str, LGBMClassifier] = {}
     scalers: dict[str, RobustScaler]   = {}
     loto_rows: list[dict] = []
@@ -683,35 +685,62 @@ def train(mislabels_csv: Path, out_dir: Path, verbose: bool = True) -> dict:
             sc   = RobustScaler()
             clf  = LGBMClassifier(**LGBM_PARAMS)
             clf.fit(sc.fit_transform(X_tr), y_tr)
-            p_va = clf.predict_proba(sc.transform(X_va))[:, 1]
 
-            # Dual-target threshold: IoU-optimal OR recall-floor, whichever is lower
+            # For threshold optimization, we MUST use the full tile + post-processing
+            # to match the final submission logic (Union IoU).
             best_iou, best_t = 0.0, 0.5
-            recall_t = 0.15   # most aggressive fallback
-            for t in np.arange(0.15, 0.85, 0.01):
-                pred_t = (p_va >= t).astype(int)
-                iou = compute_iou(y_va, pred_t)
-                rec = compute_recall(y_va, pred_t)
-                if iou > best_iou:
-                    best_iou, best_t = iou, float(t)
-                if rec >= RECALL_TARGET:
-                    recall_t = float(t)   # keep updating → highest t with recall≥target
+            data_va = load_tile_data(held, "train", verbose=False)
+            if data_va:
+                feats_va, info_va, _ = data_va
+                H, W = info_va["shape"]
+                
+                # Get full ground truth for this tile
+                td_va = load_tile(held)
+                trows_va = mislabels[mislabels["tile_id"] == held] if mislabels is not None else None
+                gt_va, _ = build_gt_pixel_map(td_va, trows_va)
+                gt_va_flat = gt_va.ravel()
+                
+                # Predict full tile
+                p_va_full = clf.predict_proba(sc.transform(feats_va))[:, 1].reshape(H, W)
+                
+                # Search for threshold that maximizes IoU AFTER post-processing
+                for t in np.arange(0.15, 0.86, 0.05): # 0.05 steps for speed in LOTO
+                    bin_va = post_process_mask(p_va_full, float(t))
+                    iou = compute_iou(gt_va_flat, bin_va.ravel())
+                    if iou > best_iou:
+                        best_iou, best_t = iou, float(t)
+                
+                # Refine around best_t with 0.01 steps
+                for t in np.arange(max(0.15, best_t - 0.04), min(0.85, best_t + 0.04), 0.01):
+                    bin_va = post_process_mask(p_va_full, float(t))
+                    iou = compute_iou(gt_va_flat, bin_va.ravel())
+                    if iou > best_iou:
+                        best_iou, best_t = iou, float(t)
 
-            # Select threshold that maximizes IoU on the cross-validation tile
             final_t = best_t
-            pred = (p_va >= final_t).astype(int)
-            oof_preds[held] = {
-                "iou": compute_iou(y_va, pred),
-                "recall": compute_recall(y_va, pred),
-                "fpr": compute_fpr(y_va, pred),
-                "thresh": final_t,
-            }
+            if data_va:
+                final_bin = post_process_mask(p_va_full, final_t).ravel()
+                oof_preds[held] = {
+                    "iou": compute_iou(gt_va_flat, final_bin),
+                    "recall": compute_recall(gt_va_flat, final_bin),
+                    "fpr": compute_fpr(gt_va_flat, final_bin),
+                    "thresh": final_t,
+                }
+            else:
+                p_va_sampled = clf.predict_proba(sc.transform(X_va))[:, 1]
+                pred = (p_va_sampled >= final_t).astype(int)
+                oof_preds[held] = {
+                    "iou": compute_iou(y_va, pred),
+                    "recall": compute_recall(y_va, pred),
+                    "fpr": compute_fpr(y_va, pred),
+                    "thresh": final_t,
+                }
+            
             loto_rows.append({"tile": held, "region": region, **oof_preds[held]})
             if verbose:
                 r = oof_preds[held]
                 print(f"    {held}: IoU={r['iou']:.3f}  Recall={r['recall']:.3f}  "
-                      f"FPR={r['fpr']:.3f}  thresh={r['thresh']:.2f}"
-                      f"  (iou_t={best_t:.2f} recall_t={recall_t:.2f})")
+                      f"FPR={r['fpr']:.3f}  thresh={r['thresh']:.2f}")
 
         # Median threshold for region
         region_thresh = float(np.median([v["thresh"] for v in oof_preds.values()])) \
@@ -788,6 +817,56 @@ def train(mislabels_csv: Path, out_dir: Path, verbose: bool = True) -> dict:
     return artifacts
 
 
+def post_process_mask(proba_2d: np.ndarray, thresh: float) -> np.ndarray:
+    """
+    Applies the standardized post-processing pipeline:
+    Gaussian smoothing -> Thresholding -> Binary Opening (noise) -> Binary Closing (holes).
+    """
+    # Gaussian spatial smoothing — kills isolated-pixel FP
+    prob_map = gaussian_filter(proba_2d, sigma=GAUSS_SIGMA)
+    # Morphological clean-up
+    binary_map = (prob_map >= thresh).astype(np.uint8)
+    binary_map = binary_opening(binary_map, iterations=1).astype(np.uint8)
+    binary_map = binary_closing(binary_map, iterations=2).astype(np.uint8)
+    return binary_map
+
+
+def load_tile_data(tile_id: str, split: str, verbose: bool = True):
+    """
+    Standard loader for full-tile features used by both training/LOTO and prediction.
+    Returns (feats, info_dict, ndvi_sar) or None.
+    """
+    s2_dir   = DATA_ROOT / "sentinel-2" / split / f"{tile_id}__s2_l2a"
+    s2_files = sorted(s2_dir.glob("*.tif"))
+    if not s2_files:
+        if verbose: print(f"  {tile_id}: no S2 — SKIP")
+        return None
+
+    with rasterio.open(s2_files[0]) as src:
+        info = {
+            "transform": src.transform,
+            "crs": src.crs,
+            "shape": src.shape
+        }
+
+    H, W = info["shape"]
+    aef_by_year = load_aef_all_years(tile_id, split, info["transform"], info["crs"], info["shape"])
+    if not aef_by_year or 2020 not in aef_by_year:
+        if verbose: print(f"  {tile_id}: missing AEF — SKIP")
+        return None
+
+    ndvi_sar, ndvi_ts, ndvi_m = load_ndvi_sar_maps(tile_id, split, info["transform"], info["crs"], info["shape"])
+    harmonic_maps = None
+    if ndvi_ts is not None and ndvi_m is not None and len(ndvi_m) > 0:
+        harmonic_maps = compute_harmonic_maps(ndvi_ts, ndvi_m)
+
+    nbr_maps = compute_nbr_maps(aef_by_year, ndvi_sar, harmonic_maps)
+    feats = compute_pixel_features(
+        aef_by_year, ndvi_sar, harmonic_maps=harmonic_maps, nbr_maps=nbr_maps
+    )
+    return feats, info, ndvi_sar
+
+
 # ── prediction ────────────────────────────────────────────────────────────────
 
 def predict_tile(
@@ -800,32 +879,10 @@ def predict_tile(
     thresh = getattr(scaler, "threshold_", 0.4)
     nan_fill = getattr(scaler, "nan_fill_", None)
 
-    s2_dir   = DATA_ROOT / "sentinel-2" / split / f"{tile_id}__s2_l2a"
-    s2_files = sorted(s2_dir.glob("*.tif"))
-    if not s2_files:
-        if verbose: print(f"  {tile_id}: no S2 — SKIP")
-        return None
-
-    with rasterio.open(s2_files[0]) as src:
-        ref_transform = src.transform
-        ref_crs       = src.crs
-        ref_shape     = src.shape
-
-    H, W = ref_shape
-
-    aef_by_year = load_aef_all_years(tile_id, split, ref_transform, ref_crs, ref_shape)
-    if not aef_by_year or 2020 not in aef_by_year:
-        if verbose: print(f"  {tile_id}: missing AEF — SKIP")
-        return None
-
-    ndvi_sar, ndvi_ts, ndvi_months = load_ndvi_sar_maps(tile_id, split, ref_transform, ref_crs, ref_shape)
-
-    harmonic_maps = None
-    if ndvi_ts is not None and ndvi_months is not None and len(ndvi_months) > 0:
-        harmonic_maps = compute_harmonic_maps(ndvi_ts, ndvi_months)
-
-    nbr_maps = compute_nbr_maps(aef_by_year, ndvi_sar, harmonic_maps)
-    feats = compute_pixel_features(aef_by_year, ndvi_sar, harmonic_maps=harmonic_maps, nbr_maps=nbr_maps)   # (H*W, N_FEATURES)
+    data = load_tile_data(tile_id, split, verbose=verbose)
+    if data is None: return None
+    feats, info, ndvi_sar = data
+    H, W = info["shape"]
 
     if nan_fill is not None:
         feats = np.where(np.isfinite(feats), feats, nan_fill)
@@ -839,17 +896,15 @@ def predict_tile(
         e = min(s + CHUNK, H * W)
         proba[s:e] = model.predict_proba(scaler.transform(feats[s:e]))[:, 1]
 
-    # Gaussian spatial smoothing — kills isolated-pixel FP
-    prob_map   = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
-    # Morphological clean-up: Opening kills salt-and-pepper noise, Closing fills interior holes
-    binary_map = binary_opening(binary_map, iterations=1).astype(np.uint8)
-    binary_map = binary_closing(binary_map, iterations=2).astype(np.uint8)
+    # Full post-processing pipeline
+    binary_map = post_process_mask(proba.reshape(H, W), thresh)
 
     # Year: prefer NDVI change year (interpretable), fallback to AEF argmax
     if ndvi_sar and "ndvi_change_year_idx" in ndvi_sar:
         # ndvi_change_year_idx: 0=2021,1=2022,2=2023,3=2024
         yr_idx_map = ndvi_sar["ndvi_change_year_idx"].astype(np.int32).clip(0, 3)
     else:
+        # Fallback to feature 14 (aef_change_year_idx)
         yr_idx_map = feats[:, 14].astype(np.int32).clip(0, 3).reshape(H, W)
 
     year_map = (yr_idx_map + 2021).astype(np.int16)
@@ -860,7 +915,7 @@ def predict_tile(
         print(f"  {tile_id} [{region}]: thresh={thresh:.2f}  "
               f"defor={n_pos:,}  ({100*n_pos/(H*W):.2f}%)")
 
-    return binary_map, year_map, ref_shape, ref_transform, ref_crs
+    return binary_map, year_map, info["shape"], info["transform"], info["crs"]
 
 
 def predict_all(
