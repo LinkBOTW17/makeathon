@@ -69,7 +69,7 @@ from validate_spatial import build_gt_pixel_map               # noqa: E402
 
 AEF_YEARS         = [2020, 2021, 2022, 2023, 2024]
 DELTA_YEARS       = [2021, 2022, 2023, 2024]
-N_FEATURES        = 151
+N_FEATURES        = 158
 N_SAMPLE_PER_TILE = 80_000   # increased; positives uncapped
 GAUSS_SIGMA       = 1.5
 RECALL_TARGET     = 0.65     # minimum recall to enforce at threshold selection
@@ -99,6 +99,8 @@ FEATURE_NAMES = (
     ["aef_max_delta_l2", "aef_change_year_idx"] +
     [f"aef_delta_vec_{i:02d}" for i in range(64)] +
     ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +
+    [f"ndvi_yr_{yr}"          for yr in AEF_YEARS] +
+    ["ndvi_change_year_idx", "ndvi_max_drop"] +
     ["sar_pre", "sar_post", "sar_change"] +
     ["harmonic_t_stat", "harmonic_change_mag"] +
     [f"aef_2020_{i:02d}"      for i in range(64)]
@@ -107,6 +109,20 @@ assert len(FEATURE_NAMES) == N_FEATURES
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def tile_normalize(feats: np.ndarray) -> np.ndarray:
+    """
+    Robust z-score each feature column within the tile's own distribution.
+    Converts absolute embedding values into "deviation from this tile's median" —
+    making the model invariant to inter-tile baseline differences (forest type, region).
+    """
+    med = np.nanmedian(feats, axis=0)
+    p25 = np.nanpercentile(feats, 25, axis=0)
+    p75 = np.nanpercentile(feats, 75, axis=0)
+    iqr = p75 - p25
+    iqr = np.where(iqr < 1e-6, 1.0, iqr)
+    return ((feats - med) / iqr).astype(np.float32)
+
 
 def get_region(tile_id: str) -> str:
     prefix = tile_id[:2]
@@ -234,6 +250,30 @@ def load_ndvi_sar_maps(
         out["ndvi_post"]   = ndvi_post.astype(np.float32)
         out["ndvi_change"] = (ndvi_pre - ndvi_post).astype(np.float32)
         out["ndvi_std"]    = ndvi_std.astype(np.float32)
+
+        # Per-year NDVI means
+        step_years = np.array([m // 12 + 2020 for m in ndvi_months], dtype=np.int32)
+        yr_means: dict[int, np.ndarray] = {}
+        for yr in AEF_YEARS:
+            sel = step_years == yr
+            if sel.any():
+                yr_means[yr] = np.nanmean(ndvi_arr[sel], axis=0).astype(np.float32)
+                out[f"ndvi_yr_{yr}"] = yr_means[yr]
+            else:
+                out[f"ndvi_yr_{yr}"] = np.full((H, W), np.nan, dtype=np.float32)
+
+        # NDVI change year: which year had the largest consecutive NDVI drop
+        best_drop = np.full((H, W), -np.inf, dtype=np.float32)
+        best_yr_idx = np.zeros((H, W), dtype=np.float32)
+        for i, yr in enumerate(DELTA_YEARS):  # [2021,2022,2023,2024]
+            if yr in yr_means and (yr - 1) in yr_means:
+                drop = yr_means[yr - 1] - yr_means[yr]  # positive = NDVI dropped
+                update = np.isfinite(drop) & (drop > best_drop)
+                best_yr_idx = np.where(update, float(i), best_yr_idx)
+                best_drop   = np.where(update, drop, best_drop)
+        out["ndvi_change_year_idx"] = best_yr_idx.astype(np.float32)
+        out["ndvi_max_drop"]        = np.where(np.isfinite(best_drop), best_drop,
+                                               np.nan).astype(np.float32)
 
     # ── SAR from Sentinel-1 ───────────────────────────────────────────────────
     s1_dir   = DATA_ROOT / "sentinel-1" / split / f"{tile_id}__s1_rtc"
@@ -412,6 +452,17 @@ def compute_pixel_features(
             feats[:, c] = _px(ndvi_sar[key])
         c += 1
 
+    # ── Per-year NDVI means + change timing ──────────────────────────────────
+    for yr in AEF_YEARS:
+        key = f"ndvi_yr_{yr}"
+        if ndvi_sar and key in ndvi_sar:
+            feats[:, c] = _px(ndvi_sar[key])
+        c += 1
+    for key in ("ndvi_change_year_idx", "ndvi_max_drop"):
+        if ndvi_sar and key in ndvi_sar:
+            feats[:, c] = _px(ndvi_sar[key])
+        c += 1
+
     # ── SAR features ──────────────────────────────────────────────────────────
     for key in ("sar_pre", "sar_post", "sar_change"):
         if ndvi_sar and key in ndvi_sar:
@@ -505,6 +556,7 @@ def sample_tile(
         harmonic_maps = compute_harmonic_maps(ts_src, mo_src)
 
     feats  = compute_pixel_features(aef_by_year, ndvi_sar, rows, cols_arr, harmonic_maps)
+    feats  = tile_normalize(feats)   # within-tile z-score → region-invariant features
     labels = flat_gt[idx].astype(np.int32)
     yrs    = flat_year[idx].astype(np.int32)
     return feats, labels, yrs
@@ -721,6 +773,7 @@ def predict_tile(
         harmonic_maps = compute_harmonic_maps(ndvi_ts, ndvi_months)
 
     feats = compute_pixel_features(aef_by_year, ndvi_sar, harmonic_maps=harmonic_maps)   # (H*W, N_FEATURES)
+    feats = tile_normalize(feats)   # within-tile z-score → region-invariant
 
     if nan_fill is not None:
         feats = np.where(np.isfinite(feats), feats, nan_fill)
@@ -738,9 +791,14 @@ def predict_tile(
     prob_map    = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
     binary_map  = (prob_map >= thresh).astype(np.uint8)
 
-    # Year: argmax AEF L2 delta (feature index 14 = aef_change_year_idx)
-    year_idx   = feats[:, 14].astype(np.int32).clip(0, 3)
-    year_map   = (year_idx + 2021).astype(np.int16).reshape(H, W)
+    # Year: prefer NDVI change year (interpretable), fallback to AEF argmax
+    if ndvi_sar and "ndvi_change_year_idx" in ndvi_sar:
+        # ndvi_change_year_idx: 0=2021,1=2022,2=2023,3=2024
+        yr_idx_map = ndvi_sar["ndvi_change_year_idx"].astype(np.int32).clip(0, 3)
+    else:
+        yr_idx_map = feats[:, 14].astype(np.int32).clip(0, 3).reshape(H, W)
+
+    year_map = (yr_idx_map + 2021).astype(np.int16)
     year_map[binary_map == 0] = 0
 
     if verbose:
