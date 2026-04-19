@@ -556,7 +556,6 @@ def sample_tile(
         harmonic_maps = compute_harmonic_maps(ts_src, mo_src)
 
     feats  = compute_pixel_features(aef_by_year, ndvi_sar, rows, cols_arr, harmonic_maps)
-    feats  = tile_normalize(feats)   # within-tile z-score → region-invariant features
     labels = flat_gt[idx].astype(np.int32)
     yrs    = flat_year[idx].astype(np.int32)
     return feats, labels, yrs
@@ -773,7 +772,6 @@ def predict_tile(
         harmonic_maps = compute_harmonic_maps(ndvi_ts, ndvi_months)
 
     feats = compute_pixel_features(aef_by_year, ndvi_sar, harmonic_maps=harmonic_maps)   # (H*W, N_FEATURES)
-    feats = tile_normalize(feats)   # within-tile z-score → region-invariant
 
     if nan_fill is not None:
         feats = np.where(np.isfinite(feats), feats, nan_fill)
