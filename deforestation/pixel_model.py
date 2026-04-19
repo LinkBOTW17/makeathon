@@ -69,7 +69,7 @@ from validate_spatial import build_gt_pixel_map               # noqa: E402
 
 AEF_YEARS         = [2020, 2021, 2022, 2023, 2024]
 DELTA_YEARS       = [2021, 2022, 2023, 2024]
-N_FEATURES        = 158
+N_FEATURES        = 87
 N_SAMPLE_PER_TILE = 80_000   # increased; positives uncapped
 GAUSS_SIGMA       = 1.5
 RECALL_TARGET     = 0.65     # minimum recall to enforce at threshold selection
@@ -93,18 +93,15 @@ LGBM_PARAMS = dict(
 )
 
 FEATURE_NAMES = (
-    [f"aef_l2_delta_{yr}"     for yr in DELTA_YEARS] +
-    [f"aef_cos_delta_{yr}"    for yr in DELTA_YEARS] +
-    [f"aef_from2020_l2_{yr}"  for yr in DELTA_YEARS] +
-    ["aef_max_delta_l2", "aef_change_year_idx"] +
-    [f"aef_delta_vec_{i:02d}" for i in range(64)] +
-    ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +
-    [f"ndvi_yr_{yr}"          for yr in AEF_YEARS] +
-    ["ndvi_change_year_idx", "ndvi_max_drop"] +
-    ["sar_pre", "sar_post", "sar_change"] +
-    ["harmonic_t_stat", "harmonic_change_mag"] +
-    [f"aef_2020_{i:02d}"      for i in range(64)]
-)
+    [f"aef_l2_delta_{yr}"     for yr in DELTA_YEARS] +   # 4 — year-over-year L2
+    [f"aef_cos_delta_{yr}"    for yr in DELTA_YEARS] +   # 4 — cosine distance
+    [f"aef_from2020_l2_{yr}"  for yr in DELTA_YEARS] +  # 4 — cumulative drift from 2020
+    ["aef_max_delta_l2", "aef_change_year_idx"] +        # 2 — peak change summary
+    [f"aef_delta_vec_{i:02d}" for i in range(64)] +      # 64 — 64-dim change vector
+    ["ndvi_pre", "ndvi_post", "ndvi_change", "ndvi_std"] +  # 4 — relative NDVI signals
+    ["sar_pre", "sar_post", "sar_change"] +              # 3 — SAR change
+    ["harmonic_t_stat", "harmonic_change_mag"]           # 2 — physics-based breakpoint
+)   # total = 87; all CHANGE/RELATIVE signals — no absolute baseline values
 assert len(FEATURE_NAMES) == N_FEATURES
 
 
@@ -452,17 +449,6 @@ def compute_pixel_features(
             feats[:, c] = _px(ndvi_sar[key])
         c += 1
 
-    # ── Per-year NDVI means + change timing ──────────────────────────────────
-    for yr in AEF_YEARS:
-        key = f"ndvi_yr_{yr}"
-        if ndvi_sar and key in ndvi_sar:
-            feats[:, c] = _px(ndvi_sar[key])
-        c += 1
-    for key in ("ndvi_change_year_idx", "ndvi_max_drop"):
-        if ndvi_sar and key in ndvi_sar:
-            feats[:, c] = _px(ndvi_sar[key])
-        c += 1
-
     # ── SAR features ──────────────────────────────────────────────────────────
     for key in ("sar_pre", "sar_post", "sar_change"):
         if ndvi_sar and key in ndvi_sar:
@@ -474,11 +460,6 @@ def compute_pixel_features(
         feats[:, c]     = _px(harmonic_maps[0])   # t_stat
         feats[:, c + 1] = _px(harmonic_maps[1])   # change_mag
     c += 2
-
-    # ── AEF 2020 baseline embedding (64-dim) ──────────────────────────────────
-    if 2020 in emb:
-        feats[:, c:c + 64] = emb[2020].T
-    c += 64
 
     assert c == N_FEATURES, f"Feature count mismatch: {c} != {N_FEATURES}"
     return feats
