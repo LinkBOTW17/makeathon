@@ -124,42 +124,27 @@ def build_gt_pixel_map(
             np.stack([l[0] for l in layers], axis=0), axis=0
         ).astype(np.float32)
 
-    # ── consensus (majority vote) ─────────────────────────────────────────────
-    available = [arr for arr in [radd_raw, glads2_raw, gladl_raw]
-                 if arr.sum() > 0]
-    if not available:
-        return np.zeros((H, W), dtype=np.uint8), np.zeros((H, W), dtype=np.int16)
-
-    n = len(available)
-    vote_sum = np.stack(available, axis=0).sum(axis=0)
-    gt_binary = (vote_sum > n / 2).astype(np.uint8)
-
-    # ── GT year map from RADD/GLAD-S2 day fields ─────────────────────────────
-    gt_year = np.zeros((H, W), dtype=np.int16)
-
+    # ── GT year map from RADD/GLAD-S2 day fields (for year accuracy only) ────
     radd_year   = _days_to_year(radd_days,   _RADD_YEAR_EDGES)
     glads2_year = _days_to_year(glads2_days, _GLADS2_YEAR_EDGES)
-
-    # Use RADD year where available, fall back to GLAD-S2
     year_filled = np.where(radd_year > 0, radd_year, glads2_year)
-    gt_year = np.where(gt_binary == 1, year_filled, 0).astype(np.int16)
 
-    # ── Apply CL corrections ──────────────────────────────────────────────────
+    # ── Primary GT: burn corrected polygon labels ─────────────────────────────
+    # The competition evaluates against human-annotated polygon labels, not
+    # RADD/GLAD alerts. Using the polygon labels as GT aligns training with
+    # the leaderboard evaluation.
+    gt_binary = np.zeros((H, W), dtype=np.uint8)
+    use_polygon_gt = False
+
     if tile_rows is not None and len(tile_rows) > 0:
         try:
             gdf = build_consensus_polygons(td)
             n_match = min(len(gdf), len(tile_rows))
             for i in range(n_match):
-                row = tile_rows.iloc[i]
-                if not row.get("flagged", False):
-                    continue
-                score = row.get("mislabel_score", 0.0)
-                if score < 0.5:
-                    continue
-                given     = int(row["given_label"])
-                corrected = int(row["suggested_label"])
-                if given == corrected:
-                    continue
+                row  = tile_rows.iloc[i]
+                # Apply CL correction: use suggested_label if flagged + score >= 0.5
+                use_corr  = bool(row.get("flagged", False)) and float(row.get("mislabel_score", 0.0)) >= 0.5
+                corrected = int(row["suggested_label"]) if use_corr else int(row["given_label"])
                 geom = gdf.iloc[i].geometry
                 mask = ~geometry_mask(
                     [mapping(geom)],
@@ -168,11 +153,20 @@ def build_gt_pixel_map(
                     out_shape=(H, W),
                 )
                 gt_binary[mask] = corrected
-                if corrected == 0:
-                    gt_year[mask] = 0
+            use_polygon_gt = True
         except Exception:
-            pass  # corrections failed — use raw consensus
+            pass
 
+    # Fallback: RADD/GLAD majority vote (when no polygon labels are available)
+    if not use_polygon_gt:
+        available = [arr for arr in [radd_raw, glads2_raw, gladl_raw] if arr.sum() > 0]
+        if not available:
+            return np.zeros((H, W), dtype=np.uint8), np.zeros((H, W), dtype=np.int16)
+        n = len(available)
+        vote_sum  = np.stack(available, axis=0).sum(axis=0)
+        gt_binary = (vote_sum > n / 2).astype(np.uint8)
+
+    gt_year = np.where(gt_binary == 1, year_filled, 0).astype(np.int16)
     return gt_binary, gt_year
 
 

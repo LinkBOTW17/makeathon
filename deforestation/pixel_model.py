@@ -776,13 +776,6 @@ def predict_tile(
     prob_map    = gaussian_filter(proba.reshape(H, W), sigma=GAUSS_SIGMA)
     binary_map  = (prob_map >= thresh).astype(np.uint8)
 
-    # SAR confirmation filter — remove optical-only FP (cloud shadows, agri cycles)
-    # Real forest clearing: SAR backscatter decreases (forest → bare ground)
-    # sar_change = sar_pre − sar_post; positive ≡ SAR decreased ≡ real structural loss
-    if ndvi_sar and "sar_change" in ndvi_sar:
-        sar_confirmed = (ndvi_sar["sar_change"] > 1.0).astype(np.uint8)
-        binary_map    = binary_map & sar_confirmed
-
     # Year: prefer NDVI change year (interpretable), fallback to AEF argmax
     if ndvi_sar and "ndvi_change_year_idx" in ndvi_sar:
         # ndvi_change_year_idx: 0=2021,1=2022,2=2023,3=2024
